@@ -6,6 +6,7 @@ use App\Enums\CteDocumentStatusEnum;
 use App\Enums\CteEmissionBatchStatusEnum;
 use App\Enums\RegisterStatusEnum;
 use App\Filament\Resources\RegisterResource;
+use App\Filament\Resources\RegisterResource\Pages\CreateRegister;
 use App\Filament\Resources\RegisterResource\Pages\ListRegisters;
 use App\Filament\Resources\RegisterResource\Pages\ViewRegister;
 use App\Models\CteDocument;
@@ -108,6 +109,31 @@ class RegisterResourceTest extends TestCase
             $this->assertFalse($columns[$columnName]->isIndividuallySearchable());
             $this->assertTrue($columns[$columnName]->isGloballySearchable());
         }
+    }
+
+    public function test_register_can_be_created_when_withdrawal_deadline_is_after_delivery_deadline(): void
+    {
+        Livewire::test(CreateRegister::class)
+            ->fillForm([
+                'company' => 'millan',
+                'vehicle_model' => 'FIAT ARGO 1.3',
+                'vehicle_plate' => 'ABC1D23',
+                'origin_city' => 'São Paulo',
+                'destination_city' => 'Pirapora',
+                'vehicle_id' => '1156340',
+                'deadline_withdraw' => '2026-09-04',
+                'deadline_delivery' => '2026-09-03',
+                'status' => 'pending',
+                'value' => '500.00',
+            ])
+            ->call('create')
+            ->assertHasNoFormErrors();
+
+        $register = Register::query()->sole();
+
+        $this->assertSame('ABC1D23', $register->vehicle_plate);
+        $this->assertSame('2026-09-04', $register->deadline_withdraw->toDateString());
+        $this->assertSame('2026-09-03', $register->deadline_delivery->toDateString());
     }
 
     public function test_analysis_can_be_filtered_and_manually_resolved_from_the_register_list(): void

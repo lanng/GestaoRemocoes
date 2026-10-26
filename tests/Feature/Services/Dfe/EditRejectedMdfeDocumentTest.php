@@ -5,6 +5,7 @@ namespace Tests\Feature\Services\Dfe;
 use App\Enums\CiotLineEnum;
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
+use App\Enums\CteEmissionBatchStatusEnum;
 use App\Enums\FiscalDocumentStatusEnum;
 use App\Enums\FiscalDocumentWorkflowOriginEnum;
 use App\Filament\Resources\MdfeDocumentResource;
@@ -255,6 +256,46 @@ class EditRejectedMdfeDocumentTest extends TestCase
         Queue::assertNothingPushed();
     }
 
+    public function test_editing_cannot_create_a_replacement_ciot_while_the_batch_is_in_review(): void
+    {
+        Filament::setCurrentPanel(Filament::getPanel('admin'));
+        $this->actingAs(User::factory()->create());
+        config([
+            'ciot.api_key' => 'test-api-key',
+            'ciot.base_url' => 'https://antt-hml.test/pefServices',
+            'ciot.company.cnpj' => '12563112000130',
+            'ciot.company.rntrc' => '45963122',
+            'ciot.lines.vehicle_removal.bank_code' => '756',
+            'ciot.lines.vehicle_removal.bank_agency' => '0001',
+        ]);
+        $source = $this->rejected(withBatch: true);
+        $source->batch->forceFill(['status' => CteEmissionBatchStatusEnum::DRAFT])->save();
+        $oldCiot = $source->ciot;
+        $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
+        $vehicle = CiotVehicle::factory()->forRemoval()->create(['plate' => 'PUC8E55']);
+        $ciotCount = Ciot::query()->count();
+        $snapshot = $source->snapshot;
+        $cteDocumentIds = $source->cteDocuments->modelKeys();
+
+        Livewire::test(EditMdfeDocument::class, ['record' => $source->getRouteKey()])
+            ->set('data.ciot_mode', 'new')
+            ->set('data.new_ciot', $this->newCiotFormData($payer, $vehicle))
+            ->call('save')
+            ->assertHasErrors([
+                'data.cte_document_ids' => 'O CIOT não pode ser preparado enquanto o lote de CT-e estiver em revisão.',
+            ]);
+
+        $this->assertSame($ciotCount, Ciot::query()->count());
+        $this->assertSame(CiotStatusEnum::ISSUED, $oldCiot->fresh()->status);
+        $this->assertSame($oldCiot->id, $source->fresh()->ciot_id);
+        $this->assertSame(CteDocumentStatusEnum::REJECTED, $source->fresh()->status);
+        $this->assertSame($snapshot, $source->fresh()->snapshot);
+        $this->assertSame($cteDocumentIds, $source->fresh()->cteDocuments()->orderByPivot('position')->pluck('cte_documents.id')->all());
+        $this->assertDatabaseCount('mdfe_documents', 1);
+        Queue::assertNothingPushed();
+        Http::assertNothingSent();
+    }
+
     public function test_rejected_replacement_ciot_keeps_edit_data_and_the_previous_mdfe_link(): void
     {
         Filament::setCurrentPanel(Filament::getPanel('admin'));
@@ -377,7 +418,10 @@ class EditRejectedMdfeDocumentTest extends TestCase
 
     private function rejected(bool $withBatch = false): MdfeDocument
     {
-        $batch = $withBatch ? CteEmissionBatch::factory()->create(['execution_mode' => 'live']) : null;
+        $batch = $withBatch ? CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+            'execution_mode' => 'live',
+        ]) : null;
         $ciot = Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch?->id]);
         $cte = $this->authorizedCte($batch?->id);
         $snapshot = [

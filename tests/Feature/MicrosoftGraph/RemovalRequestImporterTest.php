@@ -62,6 +62,26 @@ class RemovalRequestImporterTest extends TestCase
         }
     }
 
+    public function test_it_imports_a_register_when_withdrawal_deadline_is_after_delivery_deadline(): void
+    {
+        Storage::fake('s3');
+        $item = $this->item(['body' => ['deadline_withdraw' => '2026-09-04']]);
+        $pdf = $this->pdf(['deadline_withdraw' => '04/09/2026']);
+
+        try {
+            $result = app(RemovalRequestImporter::class)->handle($item, $pdf);
+
+            $register = Register::query()->sole();
+
+            $this->assertSame('processed', $result->status);
+            $this->assertSame($register->id, $result->register_id);
+            $this->assertSame('2026-09-04', $register->deadline_withdraw->toDateString());
+            $this->assertSame('2026-09-03', $register->deadline_delivery->toDateString());
+        } finally {
+            @unlink($pdf->temporaryPath);
+        }
+    }
+
     public function test_zero_fipe_creates_an_alert_without_resolving_the_item(): void
     {
         Storage::fake('s3');
@@ -115,10 +135,6 @@ class RemovalRequestImporterTest extends TestCase
             'destination conflict' => [['pdf' => ['destination_city' => 'Campinas']], 'destination_city_mismatch'],
             'deadline conflict' => [['pdf' => ['deadline_delivery' => '04/09/2026']], 'deadline_delivery_mismatch'],
             'invalid model length' => [['pdf' => ['vehicle_model' => str_repeat('X', 31)]], 'invalid_constraints'],
-            'invalid date order' => [[
-                'body' => ['deadline_withdraw' => '2026-09-04'],
-                'pdf' => ['deadline_withdraw' => '04/09/2026'],
-            ], 'invalid_constraints'],
             'invalid money' => [['body' => ['value' => 'not-money']], 'invalid_constraints'],
             'value exceeds database precision' => [['body' => ['value' => '10000.00']], 'invalid_constraints'],
             'fipe exceeds database precision' => [['body' => ['fipe_value' => '1000000.00']], 'invalid_constraints'],

@@ -275,10 +275,6 @@ class RemovalRequestImporter
             }
         }
 
-        if ($canonical['deadline_withdraw'] > $canonical['deadline_delivery']) {
-            return 'invalid_constraints';
-        }
-
         if (
             $canonical['vehicle_model'] === null
             || mb_strlen($canonical['vehicle_model']) > 30

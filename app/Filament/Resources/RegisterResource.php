@@ -202,8 +202,7 @@ class RegisterResource extends Resource
                         ->native(false)
                         ->weekStartsOnSunday()
                         ->closeOnDateSelection()
-                        ->live()
-                        ->beforeOrEqual(fn (Get $get) => $get('deadline_delivery') ?? null),
+                        ->live(),
                     DatePicker::make('deadline_delivery')
                         ->label('Data limite entrega')
                         ->validationAttribute('Data limite entrega')
@@ -211,8 +210,7 @@ class RegisterResource extends Resource
                         ->native(false)
                         ->weekStartsOnSunday()
                         ->closeOnDateSelection()
-                        ->live()
-                        ->afterOrEqual('deadline_withdraw'),
+                        ->live(),
                     DatePicker::make('collected_date')
                         ->label('Data da recolha')
                         ->validationAttribute('Data da recolha')

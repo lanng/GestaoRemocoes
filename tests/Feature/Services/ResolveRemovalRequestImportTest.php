@@ -75,6 +75,32 @@ class ResolveRemovalRequestImportTest extends TestCase
         $this->assertFalse(Storage::disk('s3')->exists($candidatePath));
     }
 
+    public function test_it_applies_a_withdrawal_deadline_after_the_delivery_deadline(): void
+    {
+        Storage::fake('s3');
+        $user = User::factory()->create();
+        $register = Register::factory()->create([
+            'deadline_withdraw' => '2026-08-26',
+            'deadline_delivery' => '2026-09-03',
+        ]);
+        $candidatePath = 'candidate/CartaDeRemoção ABC1D23.pdf';
+        Storage::disk('s3')->put($candidatePath, '%PDF-candidate');
+        $item = $this->pendingItem($register, [
+            'deadline_withdraw' => ['current' => '2026-08-26', 'proposed' => '2026-09-04'],
+        ], $candidatePath);
+
+        $result = app(ResolveRemovalRequestImport::class)->apply(
+            $item,
+            $user,
+            ['deadline_withdraw'],
+            false,
+        );
+
+        $this->assertSame('2026-09-04', $register->refresh()->deadline_withdraw->toDateString());
+        $this->assertSame('2026-09-03', $register->deadline_delivery->toDateString());
+        $this->assertSame('processed', $result->status);
+    }
+
     public function test_it_rejects_a_pending_import_and_deletes_its_candidate(): void
     {
         Storage::fake('s3');
