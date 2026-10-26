@@ -2,12 +2,41 @@
 
 namespace App\Services\Dfe;
 
+use DomainException;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 
 class ValidateMdfeSnapshot
 {
     public const UFS = ['AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MT', 'MS', 'MG', 'PA', 'PB', 'PR', 'PE', 'PI', 'RJ', 'RN', 'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'];
+
+    /** @var array<string, string> */
+    private const UF_CODES = [
+        'RO' => '11', 'AC' => '12', 'AM' => '13', 'RR' => '14', 'PA' => '15', 'AP' => '16', 'TO' => '17',
+        'MA' => '21', 'PI' => '22', 'CE' => '23', 'RN' => '24', 'PB' => '25', 'PE' => '26', 'AL' => '27',
+        'SE' => '28', 'BA' => '29', 'MG' => '31', 'ES' => '32', 'RJ' => '33', 'SP' => '35', 'PR' => '41',
+        'SC' => '42', 'RS' => '43', 'MS' => '50', 'MT' => '51', 'GO' => '52', 'DF' => '53',
+    ];
+
+    /** @param array<string, mixed> $snapshot */
+    public function assertLoadingCitiesMatchOrigin(array $snapshot): void
+    {
+        $originUf = (string) data_get($snapshot, 'origin.uf');
+        $expectedPrefix = self::UF_CODES[$originUf] ?? null;
+
+        foreach ((array) ($snapshot['loading_cities'] ?? []) as $city) {
+            if (! is_array($city)) {
+                throw new DomainException("Um município de carregamento não corresponde à UF de início {$originUf} do MDF-e.");
+            }
+
+            $ibge = (string) ($city['ibge'] ?? '');
+            $cityName = (string) ($city['name'] ?? 'município sem nome');
+
+            if ($expectedPrefix === null || ! preg_match('/^\d{7}$/', (string) $ibge) || substr((string) $ibge, 0, 2) !== $expectedPrefix) {
+                throw new DomainException("O município {$cityName} (IBGE {$ibge}) não corresponde à UF de início {$originUf} do MDF-e.");
+            }
+        }
+    }
 
     /** @param array<string, mixed> $snapshot @return array<string, mixed> */
     public function handle(array $snapshot): array
@@ -92,6 +121,7 @@ class ValidateMdfeSnapshot
             'vehicle.plate' => 'placa', 'vehicle.drivers.*.cpf' => 'CPF do motorista',
             'rntrc' => 'RNTRC', 'cargo.weight_kg' => 'peso da carga',
         ])->validate();
+        $this->assertLoadingCitiesMatchOrigin($snapshot);
         foreach (['value' => 2, 'weight_kg' => 4] as $key => $precision) {
             $snapshot['cargo'][$key] = number_format((float) $snapshot['cargo'][$key], $precision, '.', '');
         }

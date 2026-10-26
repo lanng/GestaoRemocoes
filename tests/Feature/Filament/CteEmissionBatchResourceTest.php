@@ -26,6 +26,8 @@ use App\Models\MdfeDriver;
 use App\Models\MdfeEvent;
 use App\Models\Register;
 use App\Models\User;
+use App\Services\Ciot\QueueDirectMdfeEmission;
+use DomainException;
 use Filament\Facades\Filament;
 use Filament\Support\Enums\MaxWidth;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -431,6 +433,31 @@ class CteEmissionBatchResourceTest extends TestCase
         $endorsementRows = $page->get('mountedActionsData.0.endorsements');
 
         $this->assertSame('AVERBACAO-PADRAO', collect($endorsementRows)->first()['number']);
+    }
+
+    public function test_direct_mdfe_action_notifies_when_loading_city_guard_fails(): void
+    {
+        Queue::fake();
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+        $ciot = Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => ['line' => 'vehicle_removal'],
+        ]);
+        $this->mock(QueueDirectMdfeEmission::class)
+            ->shouldReceive('handleForDocuments')
+            ->once()
+            ->andThrow(new DomainException('O município Santo Antônio da Platina (IBGE 4124103) não corresponde à UF de início SP do MDF-e.'));
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->mountAction('emitMdfeDirect')
+            ->setActionData(['ciot_id' => $ciot->id, 'endorsements' => [['number' => 'AVERBACAO-TEST']]])
+            ->callMountedAction()
+            ->assertNotified('MDF-e não foi enfileirado');
+
+        $this->assertDatabaseCount('mdfe_documents', 0);
+        Queue::assertNothingPushed();
     }
 
     public function test_the_direct_mdfe_action_explains_when_batch_ctes_are_not_eligible(): void

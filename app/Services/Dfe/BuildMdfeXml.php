@@ -11,6 +11,7 @@ class BuildMdfeXml
         protected AllocateMdfeNumber $allocator,
         protected AccessKey $accessKey,
         protected BuildMdfeInsuranceSnapshot $insuranceSnapshot,
+        protected ValidateMdfeSnapshot $snapshotValidator,
     ) {}
 
     /**
@@ -359,5 +360,6 @@ class BuildMdfeXml
         $this->insuranceSnapshot->validate($snapshot['insurance']);
 
         $this->routeUfs($snapshot);
+        $this->snapshotValidator->assertLoadingCitiesMatchOrigin($snapshot);
     }
 }

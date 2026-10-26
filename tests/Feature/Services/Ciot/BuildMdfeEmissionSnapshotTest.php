@@ -45,6 +45,13 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
     {
         [$batch, $ciot] = $this->makeTrip();
         $ciot->forceFill(['freight_value_cents' => 230000])->save();
+        $ciot->forceFill(['origin' => [
+            'cidade' => 'São José do Rio Preto', 'uf' => 'SP', 'cep' => '15000000', 'ibge' => '3549805',
+        ]])->save();
+        $cte = $batch->documents()->firstOrFail();
+        $cteSnapshot = $cte->snapshot;
+        $cteSnapshot['origin'] = ['ibge' => '4124103', 'name' => 'Santo Antônio da Platina', 'uf' => 'PR'];
+        $cte->forceFill(['snapshot' => $cteSnapshot])->save();
         $vehicle = CiotVehicle::factory()->forRemoval()->create([
             'plate' => 'PUC8E55',
             'renavam' => '12345678901',
@@ -78,8 +85,9 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
         $this->assertSame('35260912563112000130570010000028171839975374', $batch->documents()->first()->access_key);
         $this->assertSame($batch->documents()->first()->access_key, $snapshot['destinations'][0]['cte_access_keys'][0]);
         $this->assertSame('50000.00', $snapshot['cargo']['value']);
+        $this->assertSame([['ibge' => '3549805', 'name' => 'São José do Rio Preto']], $snapshot['loading_cities']);
         $this->assertSame([
-            'loading_cep' => '14810539',
+            'loading_cep' => '15000000',
             'unloading_cep' => '06550000',
         ], $snapshot['inf_lotacao']);
         $this->assertSame([
@@ -91,6 +99,37 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
             'bank_code' => '033',
             'bank_agency' => '0073',
         ], $snapshot['payment']);
+    }
+
+    public function test_mismatched_ciot_origin_is_rejected_before_mdfe_queue_and_reservation(): void
+    {
+        Queue::fake();
+        [$batch, $ciot] = $this->makeTrip();
+        $ciot->forceFill(['origin' => [
+            'cidade' => 'Santo Antônio da Platina', 'uf' => 'SP', 'cep' => '86430000', 'ibge' => '4124103',
+        ]])->save();
+        CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55', 'renavam' => '12345678901', 'tare_kg' => 8000,
+            'capacity_kg' => 12000, 'type_rod' => '03', 'body_type' => '00', 'uf' => 'SP',
+        ]);
+        MdfeDriver::factory()->create([
+            'cpf' => '12345678909', 'line' => CiotLineEnum::VehicleRemoval->value, 'is_default' => true,
+        ]);
+
+        try {
+            app(QueueDirectMdfeEmission::class)->handle(
+                batch: $batch,
+                endorsements: ['AVERBACAO-OP-001'],
+                routeUfs: [],
+            );
+            $this->fail('Mismatched CIOT origin must not be queued for MDF-e emission.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('Santo Antônio da Platina', $exception->getMessage());
+        }
+
+        $this->assertDatabaseCount('mdfe_documents', 0);
+        $this->assertDatabaseCount('dfe_document_reservations', 0);
+        Queue::assertNothingPushed();
     }
 
     public function test_selects_the_configured_ncm_by_line_in_homologation_and_production_snapshots(): void

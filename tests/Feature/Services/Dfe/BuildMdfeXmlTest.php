@@ -59,6 +59,87 @@ class BuildMdfeXmlTest extends TestCase
         $this->signer = new XmlSigner(new SefazCertificate($certificate['path'], $certificate['password']));
     }
 
+    public function test_loading_city_ibge_must_match_uf_ini_before_a_number_is_allocated(): void
+    {
+        $snapshot = $this->snapshot();
+        $snapshot['loading_cities'] = [['ibge' => '4124103', 'name' => 'Santo Antônio da Platina']];
+        $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle(['AVERBACAO-TEST']);
+
+        try {
+            app(BuildMdfeXml::class)->handle($snapshot);
+            $this->fail('A municipality in PR must not be emitted with UFIni SP.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('Santo Antônio da Platina', $exception->getMessage());
+            $this->assertStringContainsString('SP', $exception->getMessage());
+        }
+
+        $this->assertDatabaseCount('mdfe_number_sequences', 0);
+    }
+
+    public function test_malformed_loading_city_ibge_is_not_sanitized_before_number_allocation(): void
+    {
+        $snapshot = $this->snapshot();
+        $snapshot['loading_cities'] = [['ibge' => '35X49805', 'name' => 'São José do Rio Preto']];
+        $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle(['AVERBACAO-TEST']);
+
+        try {
+            app(BuildMdfeXml::class)->handle($snapshot);
+            $this->fail('Malformed municipality IBGE must not be emitted.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('São José do Rio Preto', $exception->getMessage());
+        }
+
+        $this->assertDatabaseCount('mdfe_number_sequences', 0);
+    }
+
+    public function test_noncanonical_uf_ini_is_rejected_before_number_allocation(): void
+    {
+        $snapshot = $this->snapshot();
+        $snapshot['origin']['uf'] = 'sp';
+        $snapshot['route_ufs'] = ['SP'];
+        $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle(['AVERBACAO-TEST']);
+
+        try {
+            app(BuildMdfeXml::class)->handle($snapshot);
+            $this->fail('UFIni must be validated exactly as it is rendered.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('sp', $exception->getMessage());
+        }
+
+        $this->assertDatabaseCount('mdfe_number_sequences', 0);
+    }
+
+    public function test_loading_city_ibge_is_not_trimmed_before_validation(): void
+    {
+        $snapshot = $this->snapshot();
+        $snapshot['loading_cities'] = [['ibge' => ' 3549805 ', 'name' => 'São José do Rio Preto']];
+        $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle(['AVERBACAO-TEST']);
+
+        try {
+            app(BuildMdfeXml::class)->handle($snapshot);
+            $this->fail('Whitespace in the rendered municipality IBGE must be rejected.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('São José do Rio Preto', $exception->getMessage());
+        }
+
+        $this->assertDatabaseCount('mdfe_number_sequences', 0);
+    }
+
+    public function test_loading_city_may_match_a_non_emitter_start_uf(): void
+    {
+        $snapshot = $this->snapshot();
+        $snapshot['origin'] = ['ibge' => '4124103', 'name' => 'Santo Antônio da Platina', 'uf' => 'PR'];
+        $snapshot['loading_cities'] = [['ibge' => '4124103', 'name' => 'Santo Antônio da Platina']];
+        $snapshot['route_ufs'] = ['SP'];
+        $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle(['AVERBACAO-TEST']);
+
+        $built = app(BuildMdfeXml::class)->handle($snapshot, number: 900000001, series: 1, numericCode: '12345678');
+
+        $this->assertStringContainsString('<UFIni>PR</UFIni>', $built->xml);
+        $this->assertStringContainsString('<cMunCarrega>4124103</cMunCarrega>', $built->xml);
+        $this->assertDatabaseCount('mdfe_number_sequences', 0);
+    }
+
     public function test_builds_a_signed_xsd_valid_mdfe_with_real_ciot_and_insurance_fixture(): void
     {
         $snapshot = $this->snapshot();

@@ -139,7 +139,8 @@ class EditRejectedMdfeDocument
             ] : null;
             $sameSelection = (int) $locked->ciot_id === (int) $ciot->id
                 && $locked->cteDocuments()->orderByPivot('position')->pluck('cte_documents.id')->map(fn ($id): int => (int) $id)->all() === $selectedIds->all();
-            $snapshot = $sameSelection ? $locked->snapshot : app(BuildMdfeEmissionSnapshot::class)->handleForDocuments(
+            $snapshotBuilder = app(BuildMdfeEmissionSnapshot::class);
+            $snapshot = $sameSelection ? $locked->snapshot : $snapshotBuilder->handleForDocuments(
                 documents: $documents, ciot: $ciot, endorsements: $endorsements,
                 routeUfs: $data['route_ufs'], batch: $locked->batch, driver: $driver,
                 homologationFixture: $fixture,
@@ -147,6 +148,9 @@ class EditRejectedMdfeDocument
                 paymentBankCode: $locked->snapshot['payment']['bank_code'] ?? null,
                 paymentBankAgency: $locked->snapshot['payment']['bank_agency'] ?? null,
             );
+            if ($sameSelection) {
+                $snapshot['loading_cities'] = $snapshotBuilder->loadingCitiesFromCiotOrigin($ciot);
+            }
             $snapshot['insurance']['endorsements'] = $endorsements;
             if ($fixture !== null || ($snapshot['insurance']['source'] ?? null) === 'homologation_fixture') {
                 $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle($endorsements, $fixture);

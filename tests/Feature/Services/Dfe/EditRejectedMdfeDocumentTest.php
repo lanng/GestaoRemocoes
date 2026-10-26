@@ -77,6 +77,75 @@ class EditRejectedMdfeDocumentTest extends TestCase
         Http::assertNothingSent();
     }
 
+    public function test_saving_rejected_mdfe_uses_ciot_origin_for_loading_and_archives_original_attempt(): void
+    {
+        $source = $this->rejected();
+        $ciot = $source->ciot;
+        $origin = ['cidade' => 'São José do Rio Preto', 'uf' => 'SP', 'cep' => '15000000', 'ibge' => '3549805'];
+        $ciot->forceFill(['origin' => $origin])->save();
+        $snapshot = $source->snapshot;
+        $snapshot['origin'] = ['ibge' => '3549805', 'name' => 'São José do Rio Preto', 'uf' => 'SP', 'cep' => '15000000'];
+        $snapshot['loading_cities'] = [
+            ['ibge' => '3548906', 'name' => 'São Carlos'],
+            ['ibge' => '4124103', 'name' => 'Santo Antônio da Platina'],
+            ['ibge' => '3549805', 'name' => 'São José do Rio Preto'],
+        ];
+        $snapshot['inf_lotacao']['loading_cep'] = '15000000';
+        $source->forceFill(['snapshot' => $snapshot])->save();
+        $original = $source->fresh();
+        $data = app(EditRejectedMdfeDocument::class)->formData($original);
+
+        $result = app(EditRejectedMdfeDocument::class)->save($original, $data);
+
+        $this->assertSame([['ibge' => '3549805', 'name' => 'São José do Rio Preto']], $result->snapshot['loading_cities']);
+        $this->assertSame($original->snapshot['issue_at'], $result->snapshot['issue_at']);
+        $this->assertSame($original->mdfe_number, $result->mdfe_number);
+        $this->assertSame($original->series, $result->series);
+        $this->assertSame($original->access_key, $result->access_key);
+        $this->assertSame($original->payload_xml, $result->snapshot['last_rejected_attempt']['payload_xml']);
+        $this->assertSame($original->response_xml, $result->snapshot['last_rejected_attempt']['response_xml']);
+        $this->assertSame($original->snapshot['loading_cities'], $result->snapshot['last_rejected_attempt']['snapshot']['loading_cities']);
+        $this->assertSame($original->payload_xml, $result->payload_xml);
+        $this->assertSame($original->response_xml, $result->response_xml);
+        $this->assertSame(CteDocumentStatusEnum::REJECTED, $result->status);
+        Queue::assertNothingPushed();
+        Http::assertNothingSent();
+
+        $queued = app(EditRejectedMdfeDocument::class)->enqueue($result);
+
+        $this->assertSame(CteDocumentStatusEnum::QUEUED, $queued->status);
+        $this->assertSame($original->mdfe_number, $queued->mdfe_number);
+        $this->assertSame($original->series, $queued->series);
+        $this->assertSame($original->access_key, $queued->access_key);
+        $this->assertSame($original->snapshot['issue_at'], $queued->snapshot['issue_at']);
+        $this->assertSame($original->access_key, $queued->snapshot['last_rejected_attempt']['access_key']);
+        $this->assertSame($original->payload_xml, $queued->snapshot['last_rejected_attempt']['payload_xml']);
+        $this->assertSame($original->response_xml, $queued->snapshot['last_rejected_attempt']['response_xml']);
+        $this->assertNull($queued->payload_xml);
+        $this->assertNull($queued->response_xml);
+        $this->assertCount(1, Queue::pushed(EmitMdfeDirectJob::class));
+        Http::assertNothingSent();
+    }
+
+    public function test_edit_form_shows_loading_city_uf_mismatch_before_saving(): void
+    {
+        Filament::setCurrentPanel(Filament::getPanel('admin'));
+        $this->actingAs(User::factory()->create());
+        $source = $this->rejected();
+        $source->ciot->forceFill(['origin' => [
+            'cidade' => 'Santo Antônio da Platina', 'uf' => 'SP', 'cep' => '86430000', 'ibge' => '4124103',
+        ]])->save();
+
+        Livewire::test(EditMdfeDocument::class, ['record' => $source->getRouteKey()])
+            ->call('save')
+            ->assertHasFormErrors(['cte_document_ids']);
+
+        $this->assertSame(CteDocumentStatusEnum::REJECTED, $source->fresh()->status);
+        $this->assertSame('<MDFe>original</MDFe>', $source->fresh()->payload_xml);
+        Queue::assertNothingPushed();
+        Http::assertNothingSent();
+    }
+
     public function test_requeues_same_document_number_and_series_preserving_latest_rejection(): void
     {
         $source = $this->rejected();

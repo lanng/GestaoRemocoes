@@ -102,7 +102,7 @@ class BuildMdfeEmissionSnapshot
         $routeUfs = $this->normalizeRoute($routeUfs, $origin['uf'], $destination['uf']);
         $vehicle = $this->vehicleSnapshot($ciot, $driver);
         $destinations = $this->destinations($documents, $cteSnapshots);
-        $loadingCities = $this->loadingCities($cteSnapshots, $origin);
+        $loadingCities = $this->loadingCities($origin);
         $insurance = $this->insuranceSnapshot->handle($endorsements, $homologationFixture);
         $cargoValueCents = $line === CiotLineEnum::TankAlcohol
             ? $this->decimalToCents($cteSnapshots->first()['cargo_value'] ?? null)
@@ -163,6 +163,12 @@ class BuildMdfeEmissionSnapshot
             ],
             'insurance' => $insurance,
         ];
+    }
+
+    /** @return array<int, array{ibge: string, name: string}> */
+    public function loadingCitiesFromCiotOrigin(Ciot $ciot): array
+    {
+        return $this->loadingCities($this->city((array) $ciot->origin, 'origem do CIOT'));
     }
 
     /** @return array{loading_cep: string, unloading_cep: string}|null */
@@ -347,17 +353,10 @@ class BuildMdfeEmissionSnapshot
         return array_values($groups);
     }
 
-    /** @param Collection<int, array<string, mixed>> $snapshots @param array{ibge: string, name: string, uf: string} $fallback @return array<int, array{ibge: string, name: string}> */
-    private function loadingCities(Collection $snapshots, array $fallback): array
+    /** @param array{ibge: string, name: string, uf: string} $origin @return array<int, array{ibge: string, name: string}> */
+    private function loadingCities(array $origin): array
     {
-        $cities = [];
-
-        foreach ($snapshots as $snapshot) {
-            $city = $this->city((array) ($snapshot['origin'] ?? []), 'origem do CT-e');
-            $cities[$city['ibge']] = ['ibge' => $city['ibge'], 'name' => $city['name']];
-        }
-
-        return array_values($cities ?: [$fallback['ibge'] => ['ibge' => $fallback['ibge'], 'name' => $fallback['name']]]);
+        return [['ibge' => $origin['ibge'], 'name' => $origin['name']]];
     }
 
     private function decimalToCents(mixed $value): int

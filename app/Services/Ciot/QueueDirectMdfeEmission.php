@@ -13,6 +13,7 @@ use App\Models\CteEmissionBatch;
 use App\Models\MdfeDocument;
 use App\Models\MdfeDriver;
 use App\Services\Dfe\ReserveMdfeDocuments;
+use App\Services\Dfe\ValidateMdfeSnapshot;
 use DomainException;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -24,6 +25,7 @@ class QueueDirectMdfeEmission
         private readonly BuildMdfeEmissionSnapshot $snapshotBuilder,
         private readonly ValidateMdfeDocumentSelection $selectionValidator,
         private readonly ReserveMdfeDocuments $reservationService,
+        private readonly ValidateMdfeSnapshot $snapshotValidator,
     ) {}
 
     /**
@@ -149,6 +151,7 @@ class QueueDirectMdfeEmission
                 paymentBankCode: $paymentBankCode,
                 paymentBankAgency: $paymentBankAgency,
             );
+            $this->snapshotValidator->assertLoadingCitiesMatchOrigin($snapshot);
             $mdfe = MdfeDocument::query()->create([
                 'public_id' => (string) Str::uuid(),
                 'cte_emission_batch_id' => $lockedBatch?->id,
