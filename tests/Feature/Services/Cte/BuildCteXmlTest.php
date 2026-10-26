@@ -125,12 +125,55 @@ class BuildCteXmlTest extends TestCase
 
         $xml = $built->xml;
 
+        $this->assertStringContainsString('<CFOP>5353</CFOP>', $xml);
         $this->assertStringContainsString('<vPrest><vTPrest>3725.81</vTPrest><vRec>3725.81</vRec></vPrest>', $xml);
         $this->assertStringNotContainsString('<Comp>', $xml);
         $this->assertStringContainsString('<proPred>ETANOL HIDRATADO COMBUSTIVEL</proPred>', $xml);
         $this->assertStringContainsString('<infQ><cUnid>04</cUnid><tpMed>LITROS</tpMed><qCarga>21879.0000</qCarga></infQ>', $xml);
         $this->assertStringContainsString('<infDoc><infNFe><chave>35260945483450002164550010004300881365784943</chave><dPrev>2026-10-02</dPrev></infNFe></infDoc>', $xml);
         $this->assertStringNotContainsString('<xOutCat>', $xml);
+    }
+
+    /** @param array{ibge: string, name: string, uf: string} $origin */
+    #[DataProvider('batchCfopRoutes')]
+    public function test_batch_cfop_follows_the_physical_route_and_validates_the_xsd(
+        string $environment,
+        array $origin,
+        string $configuredCfop,
+        string $expectedCfop,
+    ): void {
+        config([
+            'dfe.tp_amb' => $environment,
+            'dfe.emit.uf' => 'SP',
+            'dfe.cte.cfop' => $configuredCfop,
+            'dfe.numbering_start' => $environment === '1' ? 3075 : null,
+        ]);
+
+        $snapshot = $this->vehicleSnapshot();
+        $snapshot['origin'] = $origin;
+
+        $xml = $this->signed($snapshot)->xml;
+
+        $this->assertStringContainsString('<CFOP>'.$expectedCfop.'</CFOP>', $xml);
+        $this->assertStringContainsString('<UFIni>'.$origin['uf'].'</UFIni>', $xml);
+        $this->assertStringContainsString('<UFFim>SP</UFFim>', $xml);
+    }
+
+    public static function batchCfopRoutes(): array
+    {
+        $sp = ['ibge' => '3523107', 'name' => 'Itaquaquecetuba', 'uf' => 'SP'];
+        $pr = ['ibge' => '4106902', 'name' => 'Curitiba', 'uf' => 'PR'];
+        $mg = ['ibge' => '3106200', 'name' => 'Belo Horizonte', 'uf' => 'MG'];
+        $cases = [];
+
+        foreach (['1', '2'] as $environment) {
+            $cases[$environment.' PR to SP'] = [$environment, $pr, '5353', '6932'];
+            $cases[$environment.' MG to SP'] = [$environment, $mg, '5353', '6932'];
+            $cases[$environment.' within SP'] = [$environment, $sp, '5353', '5353'];
+            $cases[$environment.' configured SP CFOP'] = [$environment, $sp, '5352', '5352'];
+        }
+
+        return $cases;
     }
 
     public function test_builds_generic_cargo_xml_with_manual_freight_and_multiple_measurements(): void

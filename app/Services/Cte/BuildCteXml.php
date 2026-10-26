@@ -73,6 +73,13 @@ class BuildCteXml
 
         $freight = $this->decimal($isGeneralCargo ? $snapshot['freight']['total'] : $snapshot['value'], 2);
         $cfop = $isGeneralCargo ? (string) $snapshot['cfop'] : (string) config('dfe.cte.cfop');
+
+        if ($this->isVehicleLine($snapshot)
+            && (string) $snapshot['origin']['uf'] !== 'SP'
+            && (string) $snapshot['destination']['uf'] === 'SP') {
+            $cfop = '6932';
+        }
+
         $nature = $isGeneralCargo ? (string) $snapshot['nat_op'] : (string) config('dfe.cte.natOp');
         $takerIndicator = $isGeneralCargo
             ? ($isHomolog ? '9' : (string) $snapshot['ind_ietoma'])
