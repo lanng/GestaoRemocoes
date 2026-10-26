@@ -168,7 +168,10 @@ class EmitCteDocument
             return;
         }
 
-        if ($document->batch->status !== CteEmissionBatchStatusEnum::APPROVED) {
+        $isApprovedRetry = $document->batch->status === CteEmissionBatchStatusEnum::PROCESSING
+            && $document->batch->approved_at !== null;
+
+        if ($document->batch->status !== CteEmissionBatchStatusEnum::APPROVED && ! $isApprovedRetry) {
             throw new DomainException('Somente lotes aprovados podem ser emitidos.');
         }
     }

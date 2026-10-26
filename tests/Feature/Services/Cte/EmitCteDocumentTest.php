@@ -3,10 +3,13 @@
 namespace Tests\Feature\Services\Cte;
 
 use App\Enums\CteDocumentStatusEnum;
+use App\Enums\CteEmissionBatchStatusEnum;
+use App\Enums\FiscalDocumentStatusEnum;
 use App\Enums\RegisterStatusEnum;
 use App\Jobs\EmitCteDirectJob;
 use App\Models\IntegrationInboxItem;
 use App\Services\Cte\CreateAlcoholCteDocument;
+use App\Services\Cte\CteDocumentRecoveryService;
 use App\Services\Cte\EmitCteDocument;
 use App\Services\Cte\QueueCteDocumentEmission;
 use App\Services\Dfe\DfeDocumentStore;
@@ -253,6 +256,64 @@ class EmitCteDocumentTest extends TestCase
         $this->assertSame('225', $document->fiscal_status_code);
         $this->assertStringContainsString('Duplicidade', (string) $document->fiscal_status_message);
         $this->assertNull($document->xml_path);
+    }
+
+    public function test_retrying_a_batch_cfop_rejection_rebuilds_the_xml_with_the_correct_cfop(): void
+    {
+        Http::preventStrayRequests();
+        DfeSoapResponses::fakeTransmission($this->baseUrl);
+        config(['dfe.cte.cfop' => '5353']);
+        $document = $this->liveDirectDocument();
+        $snapshot = $document->snapshot;
+        $snapshot['origin'] = ['ibge' => '4106902', 'name' => 'Curitiba', 'uf' => 'PR'];
+        $document->forceFill([
+            'snapshot' => $snapshot,
+            'status' => CteDocumentStatusEnum::REJECTED,
+            'fiscal_status' => FiscalDocumentStatusEnum::NOT_AUTHORIZED,
+            'cte_number' => '3075',
+            'access_key' => str_repeat('3', 44),
+            'payload_xml' => '<CTe><ide><CFOP>5353</CFOP></ide></CTe>',
+            'fiscal_status_code' => '519',
+            'fiscal_status_message' => 'Rejeição: CFOP inválido para operação.',
+        ])->save();
+        $document->batch->forceFill([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED_WITH_ERRORS,
+            'completed_at' => now(),
+        ])->save();
+
+        $queued = app(CteDocumentRecoveryService::class)->retry($document);
+        $this->assertNull($queued->payload_xml);
+        (new EmitCteDirectJob($queued->id))->handle(app(EmitCteDocument::class));
+
+        $document->refresh();
+        $this->assertSame(CteDocumentStatusEnum::AUTHORIZED, $document->status);
+        $this->assertSame($snapshot, $document->snapshot);
+        $this->assertStringContainsString('<CFOP>6932</CFOP>', (string) $document->payload_xml);
+        $this->assertNotSame('3075', $document->cte_number);
+        Http::assertSent(fn ($request): bool => str_contains(
+            DfeSoapResponses::transmittedXml($request->body()),
+            '<CFOP>6932</CFOP>',
+        ));
+    }
+
+    public function test_a_processing_batch_without_recorded_approval_cannot_be_emitted(): void
+    {
+        Http::preventStrayRequests();
+        $document = $this->liveDirectDocument();
+        $document->batch->forceFill([
+            'status' => CteEmissionBatchStatusEnum::PROCESSING,
+            'approved_by' => null,
+            'approved_at' => null,
+        ])->save();
+
+        (new EmitCteDirectJob($document->id))->handle(app(EmitCteDocument::class));
+
+        $document->refresh();
+        $this->assertSame(CteDocumentStatusEnum::FAILED_BEFORE_AUTHORIZATION, $document->status);
+        $this->assertSame('Somente lotes aprovados podem ser emitidos.', $document->error_message);
+        $this->assertNull($document->payload_xml);
+        $this->assertDatabaseCount('cte_number_sequences', 0);
+        Http::assertNothingSent();
     }
 
     public function test_a_retryable_failure_leaves_the_document_authorizing_for_the_job(): void
