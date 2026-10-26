@@ -5,6 +5,7 @@ namespace App\Filament\Resources\CteEmissionBatchResource\Pages;
 use App\Enums\CiotLineEnum;
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
+use App\Enums\FiscalDocumentStatusEnum;
 use App\Filament\Actions\AddRegistersToCteBatchAction;
 use App\Filament\Actions\GenerateCiotForBatchAction;
 use App\Filament\Resources\CteEmissionBatchResource;
@@ -14,6 +15,7 @@ use App\Models\Ciot;
 use App\Models\MdfeDocument;
 use App\Models\MdfeDriver;
 use App\Services\Ciot\EmitCiotDeclaration;
+use App\Services\Ciot\PrepareMdfeDocument;
 use App\Services\Ciot\QueueDirectMdfeEmission;
 use App\Services\Cte\ApproveCteEmissionBatch;
 use App\Services\Cte\CheckCteBatchParties;
@@ -33,6 +35,7 @@ use Filament\Forms\Get;
 use Filament\Forms\Set;
 use Filament\Notifications\Notification;
 use Filament\Resources\Pages\ViewRecord;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Storage;
 use Livewire\Attributes\On;
 
@@ -135,6 +138,31 @@ class ViewCteEmissionBatch extends ViewRecord
             ->first(fn (MdfeDocument $document): bool => ! $document->ciot?->isSyntheticHomologation());
     }
 
+    private function hasNonCancelledMdfeForBatch(): bool
+    {
+        return MdfeDocument::query()
+            ->where(function (Builder $query): void {
+                $query
+                    ->where('cte_emission_batch_id', $this->record->id)
+                    ->orWhereHas('cteDocuments', fn (Builder $query): Builder => $query
+                        ->where('cte_emission_batch_id', $this->record->id));
+            })
+            ->whereNotIn('status', [
+                CteDocumentStatusEnum::REJECTED->value,
+                CteDocumentStatusEnum::FAILED_BEFORE_AUTHORIZATION->value,
+                CteDocumentStatusEnum::CANCELLED->value,
+            ])
+            ->where(function (Builder $query): void {
+                $query->whereNull('fiscal_status')
+                    ->orWhere('fiscal_status', '!=', FiscalDocumentStatusEnum::CANCELLED->value);
+            })
+            ->where(function (Builder $query): void {
+                $query->whereNull('fiscal_status_code')
+                    ->orWhere('fiscal_status_code', '!=', '101');
+            })
+            ->exists();
+    }
+
     private function runTransportClosure(MdfeDocument $mdfe): void
     {
         try {
@@ -174,11 +202,8 @@ class ViewCteEmissionBatch extends ViewRecord
                 ->icon('heroicon-m-document-plus')
                 ->color('primary')
                 ->url(fn (): string => MdfeDocumentResource::getUrl('create', ['batch' => $this->record->id]))
-                ->visible(fn (): bool => $this->record->documents()
-                    ->eligibleForNewMdfe()
-                    ->where('status', CteDocumentStatusEnum::AUTHORIZED->value)
-                    ->whereNotNull('access_key')
-                    ->exists()),
+                ->visible(fn (): bool => app(PrepareMdfeDocument::class)
+                    ->hasEligibleCteDocumentsForBatch((int) $this->record->id)),
             Actions\Action::make('downloadDamdfe')
                 ->label('Baixar DAMDFE')
                 ->icon('heroicon-o-arrow-down-tray')
@@ -288,9 +313,7 @@ class ViewCteEmissionBatch extends ViewRecord
                 ->visible(fn (): bool => in_array($this->record->refresh()->status?->value, ['completed', 'completed_with_errors'], true)
                     && $this->directMdfeCiotOptions() !== []
                     && $this->record->documents()->exists()
-                    && ! $this->record->mdfeDocuments()
-                        ->whereNotIn('status', ['rejected', 'failed_before_authorization', 'cancelled'])
-                        ->exists())
+                    && ! $this->hasNonCancelledMdfeForBatch())
                 ->disabled(fn (): bool => $this->directMdfeBlockReason() !== null)
                 ->tooltip(fn (): ?string => $this->directMdfeBlockReason())
                 ->form([

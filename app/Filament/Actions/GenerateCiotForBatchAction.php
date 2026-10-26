@@ -46,7 +46,9 @@ class GenerateCiotForBatchAction
                 CteEmissionBatchStatusEnum::PROCESSING,
                 CteEmissionBatchStatusEnum::COMPLETED,
                 CteEmissionBatchStatusEnum::COMPLETED_WITH_ERRORS,
-            ], true))
+            ], true) && ! $batch->ciots()
+                ->where('status', '!=', CiotStatusEnum::CANCELED->value)
+                ->exists())
             ->modalHeading('Gerar CIOT da viagem')
             ->modalSubmitActionLabel('Gerar e emitir')
             ->modalDescription(new \Illuminate\Support\HtmlString($prefill['ranking'] !== ''

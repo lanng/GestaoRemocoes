@@ -146,6 +146,17 @@ class PrepareMdfeDocument
             ->values();
     }
 
+    public function hasEligibleCteDocumentsForBatch(int $batchId): bool
+    {
+        foreach (CiotLineEnum::cases() as $line) {
+            if ($this->eligibleCteDocumentQuery($line, $batchId)->exists()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /** @return Builder<CteDocument> */
     private function eligibleCteDocumentQuery(CiotLineEnum $line, ?int $batchId = null): Builder
     {

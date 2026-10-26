@@ -5,6 +5,7 @@ namespace Tests\Feature\Filament;
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
 use App\Enums\CteEmissionBatchStatusEnum;
+use App\Enums\FiscalDocumentStatusEnum;
 use App\Enums\RegisterStatusEnum;
 use App\Filament\Resources\CiotResource;
 use App\Filament\Resources\CteEmissionBatchResource;
@@ -33,6 +34,7 @@ use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Livewire\Livewire;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
 class CteEmissionBatchResourceTest extends TestCase
@@ -89,12 +91,220 @@ class CteEmissionBatchResourceTest extends TestCase
         CteDocument::factory()->authorized()->create([
             'cte_emission_batch_id' => $batch->id,
             'workflow_origin' => 'controlled_v1',
+            'snapshot' => ['line' => 'vehicle_removal'],
         ]);
 
         Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
             ->assertSuccessful()
             ->assertActionVisible('prepareMdfe')
             ->assertActionHasUrl('prepareMdfe', MdfeDocumentResource::getUrl('create', ['batch' => $batch->id]));
+    }
+
+    public function test_a_completed_batch_hides_ciot_and_mdfe_actions_when_its_ctes_are_covered_by_an_authorized_mdfe(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $cte = $this->createAuthorizedBatchCte($batch);
+        $secondCte = $this->createAuthorizedBatchCte($batch);
+        $mdfe = $this->createAuthorizedMdfe(['cte_emission_batch_id' => $batch->id]);
+        $mdfe->cteDocuments()->attach($cte->id, ['position' => 1]);
+        $mdfe->cteDocuments()->attach($secondCte->id, ['position' => 2]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionHidden('generateCiot')
+            ->assertActionHidden('prepareMdfe')
+            ->assertActionHidden('emitMdfeDirect');
+    }
+
+    public function test_mdfe_preparation_is_hidden_when_every_eligible_cte_is_already_covered(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $cte = $this->createAuthorizedBatchCte($batch);
+        $mdfe = $this->createAuthorizedMdfe(['cte_emission_batch_id' => $batch->id]);
+        $mdfe->cteDocuments()->attach($cte->id, ['position' => 1]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionHidden('prepareMdfe');
+    }
+
+    public function test_a_completed_batch_hides_mdfe_actions_when_its_ctes_are_covered_only_through_the_pivot(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $cte = $this->createAuthorizedBatchCte($batch);
+        $mdfe = $this->createAuthorizedMdfe(['cte_emission_batch_id' => null]);
+        $mdfe->cteDocuments()->attach($cte->id, ['position' => 1]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionHidden('generateCiot')
+            ->assertActionHidden('prepareMdfe')
+            ->assertActionHidden('emitMdfeDirect');
+    }
+
+    public function test_direct_mdfe_emission_is_hidden_when_an_authorized_mdfe_is_linked_only_through_the_cte_pivot(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $cte = $this->createAuthorizedBatchCte($batch);
+        $mdfe = $this->createAuthorizedMdfe(['cte_emission_batch_id' => null]);
+        $mdfe->cteDocuments()->attach($cte->id, ['position' => 1]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionHidden('emitMdfeDirect');
+    }
+
+    public function test_mdfe_preparation_remains_available_for_an_uncovered_cte_in_a_partially_covered_batch(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $coveredCte = $this->createAuthorizedBatchCte($batch);
+        $this->createAuthorizedBatchCte($batch);
+        $mdfe = $this->createAuthorizedMdfe(['cte_emission_batch_id' => null]);
+        $mdfe->cteDocuments()->attach($coveredCte->id, ['position' => 1]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionVisible('prepareMdfe')
+            ->assertActionHidden('emitMdfeDirect');
+    }
+
+    public function test_mdfe_from_another_batch_does_not_hide_direct_emission(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $this->createAuthorizedBatchCte($batch);
+
+        $otherBatch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        $otherCte = $this->createAuthorizedBatchCte($otherBatch);
+        $otherMdfe = $this->createAuthorizedMdfe(['cte_emission_batch_id' => $otherBatch->id]);
+        $otherMdfe->cteDocuments()->attach($otherCte->id, ['position' => 1]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionVisible('emitMdfeDirect');
+    }
+
+    #[DataProvider('recoverableMdfeStatusCases')]
+    public function test_direct_mdfe_emission_stays_visible_for_recoverable_mdfe_statuses(CteDocumentStatusEnum $mdfeStatus): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $cte = $this->createAuthorizedBatchCte($batch);
+        $mdfe = $this->createAuthorizedMdfe([
+            'cte_emission_batch_id' => $batch->id,
+            'status' => $mdfeStatus,
+        ]);
+        $mdfe->cteDocuments()->attach($cte->id, ['position' => 1]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionVisible('emitMdfeDirect');
+    }
+
+    /** @return array<string, array{CteDocumentStatusEnum}> */
+    public static function recoverableMdfeStatusCases(): array
+    {
+        return [
+            'rejected' => [CteDocumentStatusEnum::REJECTED],
+            'failed before authorization' => [CteDocumentStatusEnum::FAILED_BEFORE_AUTHORIZATION],
+            'cancelled' => [CteDocumentStatusEnum::CANCELLED],
+        ];
+    }
+
+    #[DataProvider('cancelledMdfeVisibilityCases')]
+    public function test_mdfe_preparation_and_emission_are_available_after_fiscal_cancellation(array $cancellation): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $cte = $this->createAuthorizedBatchCte($batch);
+        $mdfe = $this->createAuthorizedMdfe([
+            'cte_emission_batch_id' => $batch->id,
+            ...$cancellation,
+        ]);
+        $mdfe->cteDocuments()->attach($cte->id, ['position' => 1]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionVisible('prepareMdfe')
+            ->assertActionVisible('emitMdfeDirect');
+    }
+
+    /** @return array<string, array{array<string, mixed>}> */
+    public static function cancelledMdfeVisibilityCases(): array
+    {
+        return [
+            'fiscal status confirms cancellation' => [['fiscal_status' => FiscalDocumentStatusEnum::CANCELLED]],
+            'cancellation event code confirms cancellation' => [['fiscal_status_code' => '101']],
+        ];
+    }
+
+    /** @return array<string, array{?CiotStatusEnum, bool}> */
+    public static function ciotGenerationVisibilityCases(): array
+    {
+        return [
+            'no previous CIOT' => [null, true],
+            'only cancelled CIOT' => [CiotStatusEnum::CANCELED, true],
+            'draft CIOT' => [CiotStatusEnum::DRAFT, false],
+            'pending CIOT' => [CiotStatusEnum::PENDING, false],
+            'issued CIOT' => [CiotStatusEnum::ISSUED, false],
+            'closed CIOT' => [CiotStatusEnum::CLOSED, false],
+            'failed CIOT' => [CiotStatusEnum::FAILED, false],
+        ];
+    }
+
+    #[DataProvider('ciotGenerationVisibilityCases')]
+    public function test_generate_ciot_visibility_matches_the_batch_creation_guard(?CiotStatusEnum $existingStatus, bool $visible): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+
+        if ($existingStatus !== null) {
+            Ciot::factory()->create([
+                'cte_emission_batch_id' => $batch->id,
+                'status' => $existingStatus,
+            ]);
+        }
+
+        $component = Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id]);
+
+        if ($visible) {
+            $component->assertActionVisible('generateCiot');
+
+            return;
+        }
+
+        $component->assertActionHidden('generateCiot');
+    }
+
+    public function test_failed_batch_ciot_keeps_the_reemission_recovery_action_available(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+        ]);
+        Ciot::factory()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'status' => CiotStatusEnum::FAILED,
+        ]);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionHidden('generateCiot')
+            ->assertActionVisible('reemitCiot');
     }
 
     public function test_the_damdfe_download_action_is_available_for_an_authorized_mdfe_with_stored_xml(): void
@@ -250,6 +460,7 @@ class CteEmissionBatchResourceTest extends TestCase
         CteDocument::factory()->authorized()->create([
             'cte_emission_batch_id' => $batch->id,
             'workflow_origin' => 'controlled_v1',
+            'snapshot' => ['line' => 'vehicle_removal'],
         ]);
         CteDocument::factory()->create([
             'cte_emission_batch_id' => $batch->id,
@@ -672,25 +883,8 @@ class CteEmissionBatchResourceTest extends TestCase
             'status' => CiotStatusEnum::ISSUED,
         ]);
 
-        $count = Ciot::query()->where('cte_emission_batch_id', $batch->id)->count();
-
         Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
-            ->callAction('generateCiot', data: [
-                'operation_type' => 'lotation',
-                'payer_id' => 1,
-                'delivery_payer_id' => 1,
-                'origin.ibge' => '3534609',
-                'destination.ibge' => '3508504',
-                'distance_km' => '716',
-                'freight_value' => '500.00',
-                'cargo_weight_kg' => '2000',
-                'vehicle_ids' => [1],
-                'travel_start_at' => now()->addDay()->format('Y-m-d'),
-                'travel_end_at' => now()->addDays(2)->format('Y-m-d'),
-            ])
-            ->assertNotified('Este lote já possui um CIOT ativo');
-
-        $this->assertSame($count, Ciot::query()->where('cte_emission_batch_id', $batch->id)->count());
+            ->assertActionHidden('generateCiot');
     }
 
     public function test_the_batch_list_uses_translated_labels_and_brasilia_dates(): void
@@ -1250,5 +1444,25 @@ class CteEmissionBatchResourceTest extends TestCase
             ->assertTableColumnStateSet('party_review_status', 'Rejeitado', record: $rejected)
             ->assertTableColumnStateSet('confirmed_sender', 'Remetente congelado', record: $authorized)
             ->assertTableColumnStateSet('confirmed_destination', 'Destinatário congelado', record: $authorized);
+    }
+
+    private function createAuthorizedBatchCte(CteEmissionBatch $batch): CteDocument
+    {
+        return CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => ['line' => 'vehicle_removal'],
+        ]);
+    }
+
+    /** @param array<string, mixed> $attributes */
+    private function createAuthorizedMdfe(array $attributes = []): MdfeDocument
+    {
+        return MdfeDocument::factory()->create(array_merge([
+            'status' => CteDocumentStatusEnum::AUTHORIZED,
+            'access_key' => str_repeat('4', 44),
+            'protocol' => '935260000000004',
+            'fiscal_status_code' => '100',
+        ], $attributes));
     }
 }
