@@ -5,6 +5,7 @@ namespace App\Filament\Resources\CteEmissionBatchResource\Pages;
 use App\Enums\CiotLineEnum;
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
+use App\Filament\Actions\AddRegistersToCteBatchAction;
 use App\Filament\Actions\GenerateCiotForBatchAction;
 use App\Filament\Resources\CteEmissionBatchResource;
 use App\Filament\Resources\MdfeDocumentResource;
@@ -166,6 +167,7 @@ class ViewCteEmissionBatch extends ViewRecord
     protected function getHeaderActions(): array
     {
         return [
+            AddRegistersToCteBatchAction::make($this->getRecord()),
             GenerateCiotForBatchAction::make($this->getRecord()),
             Actions\Action::make('prepareMdfe')
                 ->label('Preparar MDF-e')

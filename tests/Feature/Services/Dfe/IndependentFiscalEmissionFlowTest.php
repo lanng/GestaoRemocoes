@@ -318,9 +318,9 @@ class IndependentFiscalEmissionFlowTest extends TestCase
 
     public function test_canceled_vehicle_documents_rebuild_a_manifest_from_preserved_and_new_ctes_across_batches(): void
     {
-        $firstBatch = CteEmissionBatch::factory()->create();
-        $secondBatch = CteEmissionBatch::factory()->create();
-        $thirdBatch = CteEmissionBatch::factory()->create();
+        $firstBatch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+        $secondBatch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+        $thirdBatch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
         $replacementBatchOne = CteEmissionBatch::factory()->create([
             'status' => CteEmissionBatchStatusEnum::APPROVED,
             'execution_mode' => 'live',

@@ -2,9 +2,11 @@
 
 namespace Tests\Feature\Services;
 
+use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
 use App\Enums\CteEmissionBatchStatusEnum;
 use App\Jobs\EmitCteDirectJob;
+use App\Models\Ciot;
 use App\Models\City;
 use App\Models\Company;
 use App\Models\CteDocument;
@@ -179,5 +181,109 @@ class ApproveCteEmissionBatchTest extends TestCase
 
         Queue::assertNotPushed(EmitCteDirectJob::class);
         $this->assertSame(CteDocumentStatusEnum::DRY_RUN_COMPLETED, $batch->documents->first()->refresh()->status);
+    }
+
+    public function test_approval_dispatches_only_new_drafts_in_a_reopened_batch(): void
+    {
+        $user = User::factory()->create();
+        $oldRegister = Register::factory()->create();
+        $batch = app(CreateCteEmissionBatch::class)->handle(collect([$oldRegister]), $user, 'live');
+        $oldDocument = $batch->documents->first();
+        $oldDocument->forceFill([
+            'status' => CteDocumentStatusEnum::AUTHORIZED,
+            'cte_number' => '900100',
+            'access_key' => str_repeat('1', 44),
+            'protocol' => '935260000000001',
+            'fiscal_status' => 'authorized',
+            'fiscal_status_code' => '100',
+            'payload_xml' => '<CTe><infCte Id="CTE-AUTORIZADO"/></CTe>',
+            'response_xml' => '<retCTe><infProt><cStat>100</cStat></infProt></retCTe>',
+            'authorized_at' => now()->subDay(),
+        ])->save();
+        $batch->forceFill(['status' => CteEmissionBatchStatusEnum::COMPLETED])->save();
+        $oldSnapshot = $oldDocument->snapshot;
+        $newRegister = Register::factory()->create();
+
+        $reopened = app(CreateCteEmissionBatch::class)->addRegistersToBatch($batch, collect([$newRegister]));
+        $newDocument = $reopened->documents->firstWhere('register_id', $newRegister->id);
+
+        app(ApproveCteEmissionBatch::class)->handle($reopened, $user);
+
+        Queue::assertPushed(EmitCteDirectJob::class, 1);
+        Queue::assertPushed(EmitCteDirectJob::class, fn (EmitCteDirectJob $job): bool => $job->cteDocumentId === $newDocument->id);
+        $this->assertSame(CteDocumentStatusEnum::AUTHORIZED, $oldDocument->refresh()->status);
+        $this->assertSame($oldSnapshot, $oldDocument->snapshot);
+        $this->assertSame('900100', $oldDocument->cte_number);
+        $this->assertSame(str_repeat('1', 44), $oldDocument->access_key);
+        $this->assertSame('935260000000001', $oldDocument->protocol);
+        $this->assertSame('<CTe><infCte Id="CTE-AUTORIZADO"/></CTe>', $oldDocument->payload_xml);
+        $this->assertSame('<retCTe><infProt><cStat>100</cStat></infProt></retCTe>', $oldDocument->response_xml);
+        $this->assertSame(CteDocumentStatusEnum::QUEUED, $newDocument->refresh()->status);
+    }
+
+    public function test_approval_rechecks_fiscal_guards_after_new_documents_were_added(): void
+    {
+        $user = User::factory()->create();
+        $batch = app(CreateCteEmissionBatch::class)->handle(
+            collect([Register::factory()->create()]),
+            $user,
+            'live',
+        );
+        $batch->documents->first()->forceFill([
+            'status' => CteDocumentStatusEnum::AUTHORIZED,
+            'cte_number' => '900100',
+            'access_key' => str_repeat('1', 44),
+            'protocol' => '935260000000001',
+            'fiscal_status' => 'authorized',
+            'fiscal_status_code' => '100',
+        ])->save();
+        $batch->update(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+        $reopened = app(CreateCteEmissionBatch::class)->addRegistersToBatch(
+            $batch,
+            collect([Register::factory()->create()]),
+        );
+        $newDocument = $reopened->documents->firstWhere('status', CteDocumentStatusEnum::DRAFT);
+        Ciot::factory()->create([
+            'cte_emission_batch_id' => $reopened->id,
+            'status' => CiotStatusEnum::ISSUED,
+        ]);
+
+        try {
+            app(ApproveCteEmissionBatch::class)->handle($reopened, $user);
+            $this->fail('Approval must recheck CIOT and MDF-e state.');
+        } catch (ValidationException) {
+            $this->assertSame(CteEmissionBatchStatusEnum::DRAFT, $reopened->refresh()->status);
+            $this->assertSame(CteDocumentStatusEnum::DRAFT, $newDocument->refresh()->status);
+            Queue::assertNotPushed(EmitCteDirectJob::class);
+        }
+    }
+
+    public function test_approval_does_not_retry_preexisting_rejected_ctes_in_a_completed_with_errors_batch(): void
+    {
+        Queue::fake();
+        $user = User::factory()->create();
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED_WITH_ERRORS,
+            'execution_mode' => 'live',
+        ]);
+        $rejected = CteDocument::factory()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'status' => CteDocumentStatusEnum::REJECTED,
+            'emitter' => 'direct',
+            'workflow_origin' => 'controlled_v1',
+            'error_code' => '519',
+            'error_message' => 'CFOP recusado.',
+        ]);
+        $newRegister = Register::factory()->create();
+        $reopened = app(CreateCteEmissionBatch::class)->addRegistersToBatch($batch, collect([$newRegister]));
+        $newDocument = $reopened->documents->firstWhere('register_id', $newRegister->id);
+
+        app(ApproveCteEmissionBatch::class)->handle($reopened, $user);
+
+        Queue::assertPushed(EmitCteDirectJob::class, 1);
+        Queue::assertPushed(EmitCteDirectJob::class, fn (EmitCteDirectJob $job): bool => $job->cteDocumentId === $newDocument->id);
+        $this->assertSame(CteDocumentStatusEnum::REJECTED, $rejected->refresh()->status);
+        $this->assertSame('519', $rejected->error_code);
+        $this->assertSame('CFOP recusado.', $rejected->error_message);
     }
 }

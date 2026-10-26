@@ -3,6 +3,7 @@
 namespace Tests\Feature\Services\Ciot;
 
 use App\Enums\CiotStatusEnum;
+use App\Enums\CteEmissionBatchStatusEnum;
 use App\Models\Ciot;
 use App\Models\CiotVehicle;
 use App\Models\Company;
@@ -44,7 +45,7 @@ class CreateCiotForBatchTest extends TestCase
     {
         $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
         $tractor = CiotVehicle::factory()->create(['plate' => 'PUC8E55', 'type' => 'automotor', 'axles' => 3]);
-        $batch = CteEmissionBatch::factory()->create();
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::APPROVED]);
 
         $ciot = app(CreateCiotForBatch::class)->handle($batch, $this->formData($payer, $tractor));
 
@@ -71,7 +72,7 @@ class CreateCiotForBatchTest extends TestCase
     {
         $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
         $tractor = CiotVehicle::factory()->create(['plate' => 'PUC8E55', 'type' => 'automotor', 'axles' => 3]);
-        $batch = CteEmissionBatch::factory()->create();
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::APPROVED]);
         Ciot::factory()->create([
             'cte_emission_batch_id' => $batch->id,
             'status' => CiotStatusEnum::ISSUED,
@@ -91,7 +92,7 @@ class CreateCiotForBatchTest extends TestCase
     {
         $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
         $tractor = CiotVehicle::factory()->create(['plate' => 'PUC8E55', 'type' => 'automotor', 'axles' => 3]);
-        $batch = CteEmissionBatch::factory()->create();
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::APPROVED]);
         Ciot::factory()->create([
             'cte_emission_batch_id' => $batch->id,
             'status' => CiotStatusEnum::CANCELED,
@@ -102,5 +103,17 @@ class CreateCiotForBatchTest extends TestCase
 
         $this->assertSame($batch->id, $ciot->cte_emission_batch_id);
         $this->assertSame(2, Ciot::query()->where('cte_emission_batch_id', $batch->id)->count());
+    }
+
+    public function test_it_rejects_a_stale_batch_after_the_batch_was_reopened_for_review(): void
+    {
+        $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
+        $tractor = CiotVehicle::factory()->create(['plate' => 'PUC8E55', 'type' => 'automotor', 'axles' => 3]);
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::DRAFT]);
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('O CIOT não pode ser preparado enquanto o lote de CT-e estiver em revisão.');
+
+        app(CreateCiotForBatch::class)->handle($batch, $this->formData($payer, $tractor));
     }
 }

@@ -4,7 +4,9 @@ namespace App\Services\Cte;
 
 use App\Enums\CteDocumentStatusEnum;
 use App\Enums\CteEmissionBatchStatusEnum;
+use App\Enums\FiscalDocumentStatusEnum;
 use App\Enums\FiscalDocumentWorkflowOriginEnum;
+use App\Models\CteDocument;
 use App\Models\CteEmissionBatch;
 use App\Models\Register;
 use App\Models\User;
@@ -54,8 +56,6 @@ class CreateCteEmissionBatch
                     ]);
                 }
 
-                $this->validateRegister($register);
-
                 $authorizedDocument = $register->cteDocuments()
                     ->where('status', CteDocumentStatusEnum::AUTHORIZED)
                     ->orderByDesc('authorized_at')
@@ -68,22 +68,118 @@ class CreateCteEmissionBatch
                     ]);
                 }
 
-                $batch->documents()->create([
-                    'public_id' => (string) Str::uuid(),
-                    'register_id' => $register->id,
-                    'status' => CteDocumentStatusEnum::DRAFT,
-                    'snapshot' => $this->snapshot($register),
-                    'idempotency_key' => (string) Str::uuid(),
-                    'execution_mode' => $executionMode,
-                    'emitter' => 'direct',
-                    'workflow_origin' => FiscalDocumentWorkflowOriginEnum::ControlledV1,
-                    'replaced_document_id' => $authorizedDocument?->id,
-                    'replacement_reason' => $authorizedDocument !== null ? $reemissionReason : null,
-                ]);
+                $this->createDraftDocument($batch, $register, $executionMode, $authorizedDocument, $reemissionReason);
             }
 
             return $batch->load('documents');
         });
+    }
+
+    /**
+     * @param  Collection<int, Register>  $registers
+     */
+    public function addRegistersToBatch(CteEmissionBatch $batch, Collection $registers): CteEmissionBatch
+    {
+        return DB::transaction(function () use ($batch, $registers): CteEmissionBatch {
+            $lockedBatch = CteEmissionBatch::query()->lockForUpdate()->findOrFail($batch->id);
+
+            if (! in_array($lockedBatch->status, [
+                CteEmissionBatchStatusEnum::DRAFT,
+                CteEmissionBatchStatusEnum::COMPLETED,
+                CteEmissionBatchStatusEnum::COMPLETED_WITH_ERRORS,
+            ], true)) {
+                throw ValidationException::withMessages(['batch' => 'Somente lotes em rascunho ou concluídos podem receber registros.']);
+            }
+
+            if ($registers->isEmpty()) {
+                throw ValidationException::withMessages(['registers' => 'Selecione ao menos um registro.']);
+            }
+
+            $registerIds = $registers->map(fn (Register $register): int => (int) $register->id);
+
+            if ($registerIds->unique()->count() !== $registerIds->count()
+                || $lockedBatch->documents()->whereIn('register_id', $registerIds)->exists()) {
+                throw ValidationException::withMessages(['registers' => 'Um ou mais registros já estão neste lote.']);
+            }
+
+            app(AssertCteBatchCanAcceptRegisters::class)->handle($lockedBatch);
+
+            $lockedRegisters = Register::query()
+                ->whereIn('id', $registerIds)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get()
+                ->keyBy('id');
+
+            if ($lockedRegisters->count() !== $registerIds->count()) {
+                throw ValidationException::withMessages(['registers' => 'Um ou mais registros não foram encontrados.']);
+            }
+
+            $blockedStatuses = [
+                CteDocumentStatusEnum::DRAFT,
+                CteDocumentStatusEnum::QUEUED,
+                CteDocumentStatusEnum::CLAIMED,
+                CteDocumentStatusEnum::FILLING,
+                CteDocumentStatusEnum::VALIDATING,
+                CteDocumentStatusEnum::READY_TO_AUTHORIZE,
+                CteDocumentStatusEnum::AUTHORIZING,
+                CteDocumentStatusEnum::WAITING_FOR_XML,
+                CteDocumentStatusEnum::RECONCILIATION_REQUIRED,
+                CteDocumentStatusEnum::AUTHORIZED,
+                CteDocumentStatusEnum::FAILED_BEFORE_AUTHORIZATION,
+            ];
+            $existingDocuments = CteDocument::query()
+                ->whereIn('register_id', $registerIds)
+                ->whereIn('status', $blockedStatuses)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+
+            if ($existingDocuments->contains(fn (CteDocument $document): bool => $document->status !== CteDocumentStatusEnum::FAILED_BEFORE_AUTHORIZATION
+                || ((filled($document->access_key) || filled($document->payload_xml))
+                    && $document->fiscal_status !== FiscalDocumentStatusEnum::CANCELLED
+                    && $document->fiscal_status_code !== '101'))) {
+                throw ValidationException::withMessages(['registers' => 'Um ou mais registros já têm CT-e autorizado, em outro lote ativo ou com resultado incerto.']);
+            }
+
+            foreach ($registerIds as $registerId) {
+                $register = $lockedRegisters->get($registerId);
+                $this->createDraftDocument($lockedBatch, $register, $lockedBatch->execution_mode);
+            }
+
+            $lockedBatch->forceFill([
+                'status' => CteEmissionBatchStatusEnum::DRAFT,
+                'approved_by' => null,
+                'approved_at' => null,
+                'processing_started_at' => null,
+                'completed_at' => null,
+            ])->save();
+
+            return $lockedBatch->refresh()->load('documents');
+        });
+    }
+
+    private function createDraftDocument(
+        CteEmissionBatch $batch,
+        Register $register,
+        string $executionMode,
+        ?CteDocument $authorizedDocument = null,
+        ?string $reemissionReason = null,
+    ): CteDocument {
+        $this->validateRegister($register);
+
+        return $batch->documents()->create([
+            'public_id' => (string) Str::uuid(),
+            'register_id' => $register->id,
+            'status' => CteDocumentStatusEnum::DRAFT,
+            'snapshot' => $this->snapshot($register),
+            'idempotency_key' => (string) Str::uuid(),
+            'execution_mode' => $executionMode,
+            'emitter' => 'direct',
+            'workflow_origin' => FiscalDocumentWorkflowOriginEnum::ControlledV1,
+            'replaced_document_id' => $authorizedDocument?->id,
+            'replacement_reason' => $authorizedDocument !== null ? $reemissionReason : null,
+        ]);
     }
 
     /** @return array<string, string|int|null> */

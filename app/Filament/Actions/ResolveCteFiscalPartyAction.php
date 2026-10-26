@@ -2,6 +2,7 @@
 
 namespace App\Filament\Actions;
 
+use App\Enums\CteDocumentStatusEnum;
 use App\Enums\CteEmissionBatchStatusEnum;
 use App\Filament\Resources\CompanyResource;
 use App\Filament\Resources\CteEmissionBatchResource;
@@ -28,7 +29,8 @@ class ResolveCteFiscalPartyAction
         return Action::make($role === 'sender' ? 'resolveSender' : 'resolveDestination')
             ->label($role === 'sender' ? 'Conciliar remetente' : 'Conciliar destino')
             ->icon('heroicon-o-arrows-right-left')
-            ->visible(fn (CteDocument $record): bool => $record->batch?->status === CteEmissionBatchStatusEnum::DRAFT)
+            ->visible(fn (CteDocument $record): bool => $record->batch?->status === CteEmissionBatchStatusEnum::DRAFT
+                && $record->status === CteDocumentStatusEnum::DRAFT)
             ->modalDescription('Confirme a empresa pelo CNPJ. A associação será gravada para os próximos lotes com o mesmo nome de origem.')
             ->form([
                 Select::make('company_id')

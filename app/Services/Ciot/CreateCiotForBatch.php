@@ -5,6 +5,7 @@ namespace App\Services\Ciot;
 use App\Enums\CiotLineEnum;
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
+use App\Enums\CteEmissionBatchStatusEnum;
 use App\Filament\Resources\CiotResource;
 use App\Models\Ciot;
 use App\Models\CiotVehicle;
@@ -148,6 +149,10 @@ class CreateCiotForBatch
                     ->whereKey($batch->id)
                     ->lockForUpdate()
                     ->firstOrFail();
+
+            if ($lockedBatch?->status === CteEmissionBatchStatusEnum::DRAFT) {
+                throw new DomainException('O CIOT não pode ser preparado enquanto o lote de CT-e estiver em revisão.');
+            }
 
             if ($lockedBatch !== null && ! $allowActiveCiotReplacement && Ciot::query()
                 ->where('cte_emission_batch_id', $lockedBatch->id)

@@ -33,9 +33,22 @@ class DocumentsRelationManager extends RelationManager
         $this->dispatch('fiscal-parties-resolved');
     }
 
-    private function isReview(): bool
+    private function isReview(?CteDocument $document): bool
+    {
+        return $this->getOwnerRecord()->status === CteEmissionBatchStatusEnum::DRAFT
+            && ($document === null || $document->status === CteDocumentStatusEnum::DRAFT);
+    }
+
+    private function isBatchReview(): bool
     {
         return $this->getOwnerRecord()->status === CteEmissionBatchStatusEnum::DRAFT;
+    }
+
+    private function showFiscalDetails(?CteDocument $document): bool
+    {
+        return $document === null
+            ? ! $this->isBatchReview() || $this->getOwnerRecord()->documents()->where('status', '!=', CteDocumentStatusEnum::DRAFT->value)->exists()
+            : ! $this->isReview($document);
     }
 
     private function partyCheck(CteDocument $document): array
@@ -67,45 +80,57 @@ class DocumentsRelationManager extends RelationManager
                 TextColumn::make('register.vehicle_plate')->label('Placa'),
                 TextColumn::make('party_review_status')
                     ->label('Conferência')
-                    ->visible(fn (): bool => $this->isReview())
-                    ->state(fn (CteDocument $record): string => ($this->partyCheck($record)['ready'] ?? false) ? 'Pronto' : 'Pendente')
-                    ->badge()->color(fn (string $state): string => $state === 'Pronto' ? 'success' : 'warning'),
-                TextColumn::make('snapshot.origin_city')->label('Origem')->visible(fn (): bool => $this->isReview()),
-                TextColumn::make('snapshot.insurance')->label('Seguradora no registro')->wrap()->visible(fn (): bool => $this->isReview()),
+                    ->visible(fn (): bool => $this->isBatchReview())
+                    ->state(fn (CteDocument $record): string => $record->status !== CteDocumentStatusEnum::DRAFT
+                        ? ($record->status === CteDocumentStatusEnum::AUTHORIZED ? 'Já emitido' : $record->status->label())
+                        : (($this->partyCheck($record)['ready'] ?? false) ? 'Pronto' : 'Pendente'))
+                    ->badge()->color(fn (string $state, CteDocument $record): string => match ($record->status) {
+                        CteDocumentStatusEnum::DRAFT => $state === 'Pronto' ? 'success' : 'warning',
+                        CteDocumentStatusEnum::AUTHORIZED => 'success',
+                        default => $record->status->color(),
+                    }),
+                TextColumn::make('snapshot.origin_city')->label('Origem')->visible(fn (): bool => $this->isBatchReview()),
+                TextColumn::make('snapshot.insurance')->label('Seguradora no registro')->wrap()->visible(fn (): bool => $this->isBatchReview()),
                 TextColumn::make('confirmed_sender')->label('Remetente confirmado')
-                    ->visible(fn (): bool => $this->isReview())
-                    ->state(fn (CteDocument $record): ?string => $this->partyCheck($record)['sender']['party']['xNome'] ?? null)
+                    ->visible(fn (): bool => $this->isBatchReview())
+                    ->state(fn (CteDocument $record): ?string => $record->status === CteDocumentStatusEnum::DRAFT
+                        ? ($this->partyCheck($record)['sender']['party']['xNome'] ?? null)
+                        : (data_get($record->snapshot, 'rem.xNome') ?? data_get($record->snapshot, 'rem.name') ?? '—'))
                     ->description(fn (CteDocument $record): ?string => $this->partyDescription($record, 'sender'))
                     ->placeholder('A conciliar')->wrap(),
-                TextColumn::make('snapshot.destination_city')->label('Destino no registro')->visible(fn (): bool => $this->isReview()),
+                TextColumn::make('snapshot.destination_city')->label('Destino no registro')->visible(fn (): bool => $this->isBatchReview()),
                 TextColumn::make('confirmed_destination')->label('Destinatário / tomador confirmado')
-                    ->visible(fn (): bool => $this->isReview())
-                    ->state(fn (CteDocument $record): ?string => $this->partyCheck($record)['destination']['party']['xNome'] ?? null)
+                    ->visible(fn (): bool => $this->isBatchReview())
+                    ->state(fn (CteDocument $record): ?string => $record->status === CteDocumentStatusEnum::DRAFT
+                        ? ($this->partyCheck($record)['destination']['party']['xNome'] ?? null)
+                        : (data_get($record->snapshot, 'dest.xNome') ?? data_get($record->snapshot, 'dest.name') ?? '—'))
                     ->description(fn (CteDocument $record): ?string => $this->partyDescription($record, 'destination'))
                     ->placeholder('A conciliar')->wrap(),
                 TextColumn::make('party_review_errors')->label('Pendências')
-                    ->visible(fn (): bool => $this->isReview())
-                    ->state(fn (CteDocument $record): ?string => implode(' ', $this->partyCheck($record)['errors'] ?? []) ?: null)
+                    ->visible(fn (): bool => $this->isBatchReview())
+                    ->state(fn (CteDocument $record): ?string => $record->status === CteDocumentStatusEnum::DRAFT
+                        ? (implode(' ', $this->partyCheck($record)['errors'] ?? []) ?: null)
+                        : null)
                     ->placeholder('—')->wrap(),
                 TextColumn::make('status')
                     ->label('Situação')
-                    ->visible(fn (): bool => ! $this->isReview())
+                    ->visible(fn (?CteDocument $record): bool => $this->showFiscalDetails($record))
                     ->badge()
                     ->color(fn (CteDocumentStatusEnum $state): string => $state->color())
                     ->formatStateUsing(fn (CteDocumentStatusEnum $state): string => $state->label()),
                 TextColumn::make('failure_details')
                     ->label('Motivo da falha/rejeição')
-                    ->visible(fn (): bool => ! $this->isReview())
+                    ->visible(fn (?CteDocument $record): bool => $this->showFiscalDetails($record))
                     ->state(fn (CteDocument $record): ?string => $this->failureDetails($record))
                     ->placeholder('—')
                     ->limit(100)
                     ->tooltip(fn (CteDocument $record): ?string => $this->failureDetails($record))
                     ->wrap(),
-                TextColumn::make('register.vehicle_id')->label('ID veículo')->visible(fn (): bool => ! $this->isReview()),
-                TextColumn::make('cte_number')->label('Número do CT-e')->visible(fn (): bool => ! $this->isReview()),
-                TextColumn::make('access_key')->label('Chave de acesso')->limit(18)->visible(fn (): bool => ! $this->isReview()),
-                TextColumn::make('protocol')->label('Protocolo')->visible(fn (): bool => ! $this->isReview()),
-                TextColumn::make('authorized_at')->label('Autorizado em')->dateTime('d/m/Y H:i')->timezone('America/Sao_Paulo')->visible(fn (): bool => ! $this->isReview()),
+                TextColumn::make('register.vehicle_id')->label('ID veículo')->visible(fn (?CteDocument $record): bool => $this->showFiscalDetails($record)),
+                TextColumn::make('cte_number')->label('Número do CT-e')->visible(fn (?CteDocument $record): bool => $this->showFiscalDetails($record)),
+                TextColumn::make('access_key')->label('Chave de acesso')->limit(18)->visible(fn (?CteDocument $record): bool => $this->showFiscalDetails($record)),
+                TextColumn::make('protocol')->label('Protocolo')->visible(fn (?CteDocument $record): bool => $this->showFiscalDetails($record)),
+                TextColumn::make('authorized_at')->label('Autorizado em')->dateTime('d/m/Y H:i')->timezone('America/Sao_Paulo')->visible(fn (?CteDocument $record): bool => $this->showFiscalDetails($record)),
             ])
             ->actions([
                 ResolveCteFiscalPartyAction::make('sender'),
@@ -115,7 +140,8 @@ class DocumentsRelationManager extends RelationManager
                     ->label('Tentar novamente')
                     ->icon('heroicon-o-arrow-path')
                     ->color('warning')
-                    ->visible(fn (CteDocument $record): bool => CteDocumentRecoveryService::canBeRequeued($record))
+                    ->visible(fn (CteDocument $record): bool => ! $this->isBatchReview()
+                        && CteDocumentRecoveryService::canBeRequeued($record))
                     ->requiresConfirmation()
                     ->modalDescription('O CT-e será validado e enviado novamente pela emissão interna do sistema.')
                     ->action(function (CteDocument $record): void {
@@ -155,6 +181,7 @@ class DocumentsRelationManager extends RelationManager
                     ->label('Tentar novamente selecionados')
                     ->icon('heroicon-o-arrow-path')
                     ->color('warning')
+                    ->visible(fn (): bool => ! $this->isBatchReview())
                     ->requiresConfirmation()
                     ->action(function (Collection $records): void {
                         $retried = app(CteDocumentRecoveryService::class)->retryMany($records);

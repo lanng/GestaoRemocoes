@@ -45,6 +45,8 @@ class RemoveDraftCteDocument
 
             if ($batch !== null && ! $batch->documents()->exists()) {
                 $batch->delete();
+            } elseif ($batch !== null) {
+                app(CteBatchStatusUpdater::class)->handle($batch->refresh());
             }
         });
     }

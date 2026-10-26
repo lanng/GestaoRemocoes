@@ -4,6 +4,7 @@ namespace Tests\Feature\Services\Ciot;
 
 use App\Enums\CiotLineEnum;
 use App\Enums\CteDocumentStatusEnum;
+use App\Enums\CteEmissionBatchStatusEnum;
 use App\Jobs\EmitMdfeDirectJob;
 use App\Models\Ciot;
 use App\Models\CiotVehicle;
@@ -308,8 +309,8 @@ class PrepareMdfeFromDocumentsTest extends TestCase
         Queue::fake();
         config(['dfe.mdfe.default_endorsement' => 'AVERBACAO-PADRAO']);
 
-        $firstBatch = CteEmissionBatch::factory()->create();
-        $secondBatch = CteEmissionBatch::factory()->create();
+        $firstBatch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::APPROVED]);
+        $secondBatch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::APPROVED]);
         $first = $this->vehicleDocument($firstBatch);
         $second = $this->vehicleDocument($secondBatch, [
             'value' => '250.00',

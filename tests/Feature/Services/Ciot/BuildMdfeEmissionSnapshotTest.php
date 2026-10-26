@@ -3,6 +3,7 @@
 namespace Tests\Feature\Services\Ciot;
 
 use App\Enums\CiotLineEnum;
+use App\Enums\CteEmissionBatchStatusEnum;
 use App\Jobs\EmitMdfeDirectJob;
 use App\Models\Ciot;
 use App\Models\CiotVehicle;
@@ -279,6 +280,31 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
         $this->assertNotNull($multipleCteSnapshot['payment']);
     }
 
+    public function test_direct_mdfe_preparation_rejects_source_batches_in_review_with_or_without_batch_context(): void
+    {
+        foreach ([true, false] as $passBatchContext) {
+            $batch = CteEmissionBatch::factory()->create();
+            $document = CteDocument::factory()->authorized()->create([
+                'cte_emission_batch_id' => $batch->id,
+                'workflow_origin' => 'controlled_v1',
+            ]);
+            $ciot = Ciot::factory()->issued()->create(['cte_emission_batch_id' => null]);
+
+            try {
+                app(QueueDirectMdfeEmission::class)->handleForDocuments(
+                    documents: new \Illuminate\Database\Eloquent\Collection([$document]),
+                    ciot: $ciot,
+                    endorsements: ['AVERBACAO-TEST'],
+                    routeUfs: [],
+                    batch: $passBatchContext ? $batch : null,
+                );
+                $this->fail('A source batch in draft review must block MDF-e preparation.');
+            } catch (DomainException $exception) {
+                $this->assertSame('O MDF-e não pode ser preparado enquanto o lote de CT-e estiver em revisão.', $exception->getMessage());
+            }
+        }
+    }
+
     public function test_builds_payment_from_ciot_and_sums_ctes_when_ciot_freight_is_missing(): void
     {
         [$batch, $ciot] = $this->makeTrip();
@@ -395,7 +421,7 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
         string $destinationUf = 'SP',
         bool $controlledWorkflow = true,
     ): array {
-        $batch = CteEmissionBatch::factory()->create();
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
         $ciot = Ciot::factory()->issued()->create([
             'cte_emission_batch_id' => $batch->id,
             'line' => $line,

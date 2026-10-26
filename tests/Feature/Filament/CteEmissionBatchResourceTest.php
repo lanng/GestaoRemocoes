@@ -29,6 +29,7 @@ use Filament\Facades\Filament;
 use Filament\Support\Enums\MaxWidth;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Livewire\Livewire;
@@ -1129,5 +1130,125 @@ class CteEmissionBatchResourceTest extends TestCase
         ])
             ->mountTableAction('viewRegister', $document)
             ->assertSee('Não informado');
+    }
+
+    public function test_completed_batch_can_include_registers_for_draft_review(): void
+    {
+        Queue::fake();
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+            'execution_mode' => 'live',
+        ]);
+        $register = Register::factory()->create();
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertActionVisible('addRegisters')
+            ->mountAction('addRegisters')
+            ->assertFormFieldExists('register_ids', 'mountedActionForm')
+            ->setActionData(['register_ids' => [(string) $register->id]])
+            ->callMountedAction()
+            ->assertHasNoActionErrors()
+            ->assertNotified('Registros incluídos para revisão');
+
+        $batch = $batch->refresh();
+        $this->assertSame(CteEmissionBatchStatusEnum::DRAFT, $batch->status);
+        $this->assertSame(CteDocumentStatusEnum::DRAFT, $batch->documents->first()->status);
+        Queue::assertNotPushed(\App\Jobs\EmitCteDirectJob::class);
+    }
+
+    public function test_add_registers_action_reports_fiscal_guards_and_missing_ids_without_partial_changes(): void
+    {
+        $batch = CteEmissionBatch::factory()->create([
+            'status' => CteEmissionBatchStatusEnum::COMPLETED,
+            'execution_mode' => 'live',
+        ]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $register = Register::factory()->create();
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->mountAction('addRegisters')
+            ->setActionData(['register_ids' => [(string) $register->id]])
+            ->callMountedAction()
+            ->assertNotified('Não foi possível incluir os registros');
+
+        $this->assertSame(CteEmissionBatchStatusEnum::COMPLETED, $batch->refresh()->status);
+        $this->assertCount(0, $batch->documents()->get());
+
+        $batch->ciots()->delete();
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->mountAction('addRegisters')
+            ->setActionData(['register_ids' => [(string) $register->id, '999999999']])
+            ->callMountedAction()
+            ->assertNotified('Não foi possível incluir os registros');
+
+        $this->assertSame(CteEmissionBatchStatusEnum::COMPLETED, $batch->refresh()->status);
+        $this->assertCount(0, $batch->documents()->get());
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->mountAction('addRegisters')
+            ->setActionData(['register_ids' => ['999999999999999999999999999999999999']])
+            ->callMountedAction()
+            ->assertNotified('Não foi possível incluir os registros');
+
+        $this->assertSame(CteEmissionBatchStatusEnum::COMPLETED, $batch->refresh()->status);
+        $this->assertCount(0, $batch->documents()->get());
+    }
+
+    public function test_add_registers_requires_update_permission_when_view_is_allowed(): void
+    {
+        Gate::before(fn (User $user, string $ability): ?bool => match ($ability) {
+            'view' => true,
+            'update' => false,
+            default => null,
+        });
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+
+        $this->assertTrue(CteEmissionBatchResource::canView($batch));
+        $this->assertFalse(CteEmissionBatchResource::canEdit($batch));
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->assertSuccessful()
+            ->assertActionHidden('addRegisters');
+    }
+
+    public function test_reopened_mixed_batch_keeps_fiscal_details_for_authorized_documents(): void
+    {
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::DRAFT]);
+        $authorized = CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'emitter' => 'direct',
+            'workflow_origin' => 'controlled_v1',
+            'cte_number' => '900100',
+            'snapshot' => [
+                'rem' => ['xNome' => 'Remetente congelado'],
+                'dest' => ['xNome' => 'Destinatário congelado'],
+            ],
+        ]);
+        $draft = CteDocument::factory()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'status' => CteDocumentStatusEnum::DRAFT,
+            'emitter' => 'direct',
+            'workflow_origin' => 'controlled_v1',
+        ]);
+        $rejected = CteDocument::factory()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'status' => CteDocumentStatusEnum::REJECTED,
+            'emitter' => 'direct',
+            'workflow_origin' => 'controlled_v1',
+        ]);
+
+        Livewire::test(DocumentsRelationManager::class, [
+            'ownerRecord' => $batch,
+            'pageClass' => ViewCteEmissionBatch::class,
+        ])
+            ->assertSee('900100')
+            ->assertSee('Autorizado')
+            ->assertTableActionHidden('resolveSender', $authorized)
+            ->assertTableActionVisible('resolveSender', $draft)
+            ->assertTableActionHidden('retry', $rejected)
+            ->assertTableBulkActionHidden('retrySelected')
+            ->assertTableColumnStateSet('party_review_status', 'Rejeitado', record: $rejected)
+            ->assertTableColumnStateSet('confirmed_sender', 'Remetente congelado', record: $authorized)
+            ->assertTableColumnStateSet('confirmed_destination', 'Destinatário congelado', record: $authorized);
     }
 }

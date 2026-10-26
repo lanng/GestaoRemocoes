@@ -125,6 +125,26 @@ class RemoveDraftCteDocumentTest extends TestCase
         $this->assertModelExists($remaining);
     }
 
+    public function test_removing_all_new_drafts_recompletes_a_mixed_batch(): void
+    {
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::DRAFT]);
+        CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'emitter' => 'direct',
+            'workflow_origin' => 'controlled_v1',
+        ]);
+        $draft = CteDocument::factory()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'status' => CteDocumentStatusEnum::DRAFT,
+        ]);
+
+        app(RemoveDraftCteDocument::class)->handle($draft);
+
+        $this->assertModelExists($batch);
+        $this->assertSame(CteEmissionBatchStatusEnum::COMPLETED, $batch->refresh()->status);
+        $this->assertSame(CteDocumentStatusEnum::AUTHORIZED, $batch->documents()->firstOrFail()->status);
+    }
+
     public function test_it_rejects_non_draft_documents_or_batches(): void
     {
         $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::APPROVED]);

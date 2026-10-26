@@ -15,7 +15,7 @@ class CheckCteBatchParties
     public function report(CteEmissionBatch $batch): array
     {
         $checks = [];
-        foreach ($batch->documents()->with('register')->get() as $document) {
+        foreach ($batch->documents()->where('status', 'draft')->with('register')->get() as $document) {
             $checks[$document->id] = $this->inspect($document);
         }
 
@@ -55,7 +55,7 @@ class CheckCteBatchParties
                 : implode("\n", $errors)]);
         }
 
-        foreach ($batch->documents as $document) {
+        foreach ($batch->documents()->where('status', 'draft')->get() as $document) {
             $document->forceFill(['snapshot' => $checks[$document->id]['snapshot']])->save();
         }
     }

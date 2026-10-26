@@ -4,6 +4,7 @@ namespace App\Services\Ciot;
 
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
+use App\Enums\CteEmissionBatchStatusEnum;
 use App\Enums\FiscalDocumentWorkflowOriginEnum;
 use App\Jobs\EmitMdfeDirectJob;
 use App\Models\Ciot;
@@ -94,9 +95,46 @@ class QueueDirectMdfeEmission
             $paymentBankCode,
             $paymentBankAgency,
         ): MdfeDocument {
-            $lockedBatch = $batch === null
-                ? null
-                : CteEmissionBatch::query()->findOrFail($batch->id);
+            $documentIds = $documents->map(fn (CteDocument $document): int => (int) $document->id)->values();
+
+            if ($documentIds->isEmpty() || $documentIds->contains(0) || $documentIds->unique()->count() !== $documentIds->count()) {
+                throw new DomainException('Selecione CT-es persistidos e sem duplicação para preparar o MDF-e.');
+            }
+
+            $batchIds = CteDocument::query()
+                ->whereIn('id', $documentIds)
+                ->pluck('cte_emission_batch_id')
+                ->filter()
+                ->map(fn (mixed $id): int => (int) $id)
+                ->merge($batch === null ? [] : [(int) $batch->id])
+                ->unique()
+                ->sort()
+                ->values();
+            $lockedBatches = $batchIds->isEmpty()
+                ? collect()
+                : CteEmissionBatch::query()->whereIn('id', $batchIds)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+
+            if ($lockedBatches->count() !== $batchIds->count()) {
+                throw new DomainException('O lote de origem não existe mais. Atualize a página e tente novamente.');
+            }
+
+            if ($lockedBatches->contains(fn (CteEmissionBatch $sourceBatch): bool => $sourceBatch->status === CteEmissionBatchStatusEnum::DRAFT)) {
+                throw new DomainException('O MDF-e não pode ser preparado enquanto o lote de CT-e estiver em revisão.');
+            }
+
+            $lockedDocuments = CteDocument::query()
+                ->whereIn('id', $documentIds)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get()
+                ->keyBy('id');
+
+            if ($lockedDocuments->count() !== $documentIds->count()) {
+                throw new DomainException('Um ou mais CT-es selecionados não existem mais. Atualize a seleção.');
+            }
+
+            $documents = $documentIds->map(fn (int $id): CteDocument => $lockedDocuments->get($id))->values();
+            $lockedBatch = $batch === null ? null : $lockedBatches->get($batch->id);
 
             $this->selectionValidator->handle($documents, $ciot);
             $snapshot = $this->snapshotBuilder->handleForDocuments(

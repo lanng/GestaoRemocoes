@@ -28,11 +28,19 @@ class ApproveCteEmissionBatch
                 throw ValidationException::withMessages(['batch' => 'Somente lotes em rascunho podem ser aprovados.']);
             }
 
-            foreach ($batch->documents as $document) {
+            $draftDocuments = $batch->documents->where('status', CteDocumentStatusEnum::DRAFT);
+
+            if ($draftDocuments->isEmpty()) {
+                throw ValidationException::withMessages(['batch' => 'O lote não possui novos CT-es em rascunho para aprovação.']);
+            }
+
+            app(AssertCteBatchCanAcceptRegisters::class)->handle($batch);
+
+            foreach ($draftDocuments as $document) {
                 $this->ensureSnapshotStillMatches($document->register, $document->snapshot);
             }
 
-            if ($batch->documents->contains(fn (CteDocument $document): bool => $document->emitter !== 'direct'
+            if ($draftDocuments->contains(fn (CteDocument $document): bool => $document->emitter !== 'direct'
                 || $document->workflow_origin !== FiscalDocumentWorkflowOriginEnum::ControlledV1)) {
                 throw ValidationException::withMessages([
                     'batch' => 'Este lote contém CT-e do emissor antigo e está disponível somente para consulta.',
@@ -47,17 +55,18 @@ class ApproveCteEmissionBatch
                 'approved_at' => now(),
             ])->save();
 
-            $batch->documents()->update(['status' => CteDocumentStatusEnum::QUEUED]);
+            $draftIds = $draftDocuments->modelKeys();
+            $batch->documents()->whereKey($draftIds)->update(['status' => CteDocumentStatusEnum::QUEUED]);
 
-            $this->dispatchDirectEmission($batch->refresh());
+            $this->dispatchDirectEmission($batch->refresh()->load('documents'), $draftIds);
 
             return $batch->refresh()->load('documents');
         });
     }
 
-    protected function dispatchDirectEmission(CteEmissionBatch $batch): void
+    protected function dispatchDirectEmission(CteEmissionBatch $batch, array $draftIds): void
     {
-        foreach ($batch->documents as $document) {
+        foreach ($batch->documents->whereIn('id', $draftIds) as $document) {
             if ($document->execution_mode !== 'live') {
                 // dry_run no emissor direto: nada transmite à SEFAZ.
                 app(DirectCteDocumentWorkflow::class)->transition($document, CteDocumentStatusEnum::DRY_RUN_COMPLETED);
