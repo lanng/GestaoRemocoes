@@ -1,94 +1,60 @@
-# CopartRemocoes
+# GestaoRemocoes
 
-[Versão PT-Br](https://github.com/lanng/CopartRemocoes/blob/main/README-PT.md)
+[Português (Brasil)](README-PT.md)
 
-## About This Project
+CopartRemocoes is an operational web application for coordinating total-loss vehicle removals between insurance orders and transport operations. It remains in operational use and is hosted on a VPS.
 
-CopartRemocoes is a web application **currently in operational use**, designed to efficiently manage and track the removal process of compromised (total loss) vehicles for an internal company workflow. It addresses the real-world challenge of coordinating between insurance orders and transport logistics.
+## Business workflow
 
-When an insurance company declares a vehicle a total loss, they issue a PDF order containing details like addresses, vehicle model, plate, and ID. This application streamlines the registration process by allowing users to upload this PDF; a backend service then automatically reads the relevant information and pre-fills the form fields, significantly reducing manual data entry and potential errors.
+When an insurer declares a vehicle a total loss, its removal order starts a workflow that tracks the vehicle, insurer, origin and destination, collection and delivery deadlines, and operational status. Staff use the system to follow each removal through collection and delivery and to prepare completed records for payment processing.
 
-Built with **Laravel** and **Filament PHP**, the system provides enhanced control over removal operations and offers flexibility for workers to update vehicle status remotely. Each user has a unique login, ensuring all changes and creations are logged for accountability. Uploaded PDF documents are securely stored using **AWS S3**.
+## Product capabilities
 
-This project showcases the practical application of modern web development technologies (Laravel, Filament), external service integration (AWS S3), and process automation (PDF data extraction) to solve a specific business need.
+- **Operational register:** A spreadsheet-style table for searching and filtering records, updating statuses, highlighting deadlines, and reviewing vehicle and route details. Search accepts multiple pasted license plates. Selected records can be exported to Excel or JSON, or copied as an image.
+- **Removal-order PDFs:** Poppler's `pdftotext` extracts supported fields from known PDF layouts and pre-fills the registration form. Staff review the extracted data before saving; this is text extraction, not general-purpose OCR.
+- **Email workflows:** Microsoft Graph workflows process removal requests, digital checklists, and CT-e error messages. An integration inbox supports human review and reconciliation, with retries for eligible removal-request imports. Checklist synchronization is scheduled every five minutes when the application scheduler is running.
+- **Brazilian transport documents:** Configurable workflows cover CT-e (electronic freight transport document) and MDF-e (electronic road freight manifest), submitted to SEFAZ (Brazilian state tax authorities), as well as CIOT (transport operation identifier), submitted to ANTT (the national land transport authority). Capabilities include document generation, retries, reconciliation, and coordinated closure. Dry-run and homologation settings are available alongside guarded live modes. Production use depends on the deployment's configuration, certificates, credentials, and enablement flags; implementation in the codebase does not mean every integration is active in production.
+- **Payment batches:** Delivered records can be grouped into batches for review and manual confirmation in the application. The workflow does not initiate bank transfers.
+- **Activity history:** The application records selected field changes and actions in key workflows, associated with the acting user.
+- **Document storage:** Removal-order PDFs are uploaded to S3 with public visibility. Fiscal DFe documents use a separate private S3 disk.
 
-## Features
+## Technology
 
-* **Vehicle Removal Tracking:** Manage and monitor the status of vehicle removals.
-* **Automated Data Entry:** Extracts data (address, model, plate, ID, etc.) directly from uploaded PDF removal orders to auto-fill registration forms.
-* **Cloud Storage:** Securely stores uploaded PDF documents associated with each removal record using AWS S3.
-* **Internal Administration Panel:** User-friendly interface built with Filament.
-* **User Auditing:** User-specific logins for tracking actions and maintaining logs.
-* **Remote Accessibility:** Designed for flexibility, allowing updates from anywhere.
-* **Tech Stack:** Built with Laravel, Filament PHP, and integrates with AWS S3.
+- PHP 8.2+, Laravel 12, Filament 3, and Livewire 3
+- Tailwind CSS 4, Alpine.js 3, and Vite 6
+- MySQL and SQLite configurations; the example environment uses SQLite
+- Poppler for supported PDF text extraction
 
-## Setup Instructions
+## Local setup
 
-**1. Prerequisites:**
+Requirements: PHP 8.2+, Composer, Node.js (22+ recommended), and Poppler for PDF text extraction. On Debian/Ubuntu, install Poppler with `sudo apt install poppler-utils`; on macOS, use `brew install poppler`. On Windows, the same dependency can be installed in WSL.
 
-* **PHP 8.0^:** Ensure you have a compatible version of PHP installed.
-* **Composer:** [Install Composer](https://getcomposer.org/download/)
-* **Database:** A compatible relational database server (e.g., MySQL, PostgreSQL).
-* **Poppler Utilities:** This is required for the PDF text extraction feature. Install it for your operating system:
-    * **Linux (Debian/Ubuntu):**
-        ```bash
-        sudo apt update && sudo apt install poppler-utils
-        ```
-    * **Linux (Fedora/CentOS/RHEL):**
-        ```bash
-        sudo yum update && sudo yum install poppler-utils
-        # Or using dnf
-        # sudo dnf install poppler-utils
-        ```
-    * **macOS (using Homebrew):**
-        ```bash
-        brew install poppler
-        ```
-    * **Windows:**
-        * **Using Chocolatey (Recommended):** Open PowerShell as Administrator and run:
-            ```powershell
-            choco install poppler
-            ```
-          *(You might need to install Chocolatey first: [https://chocolatey.org/install](https://chocolatey.org/install))*
-        * **Manual Download:** You can find Windows binaries, but sources vary. Search for "poppler windows binaries". Ensure the installation directory containing `pdftotext.exe` is added to your system's PATH environment variable.
-        * **Using WSL (Windows Subsystem for Linux):** Install via the Linux distribution running under WSL using the Linux commands above.
-
-**2. Clone the repository:**
 ```bash
 git clone https://github.com/lanng/CopartRemocoes.git
 cd CopartRemocoes
-```
-
-**3. Install PHP Dependencies:**
-```bash
 composer install
-```
-
-**4. Environment Configuration:**
-Copy the example environment file and configure it.
-```bash
+npm ci
 cp .env.example .env
-```
-* Open `.env` and update `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`, etc.
-* Configure AWS S3 credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_BUCKET`).
-* Ensure `FILESYSTEM_DISK` is set to `s3` (or your configured disk for PDFs).
-* Or change it the `FILESYSTEM_DISK` to store in the app for testing.
-* Generate the application key:
-```bash
 php artisan key:generate
-```
-
-**6. Database Migrations & Seeding:**
-```bash
+touch database/database.sqlite
 php artisan migrate
+php artisan make:filament-user
+composer run dev
 ```
 
-**7. Serve the Application:**
+The example environment defaults to SQLite, and `database/database.sqlite` must exist before migrations run. `make:filament-user` prompts for the account details. Open `/admin` and sign in. `composer run dev` starts the web server, queue listener, log output, and Vite; it does not run the scheduler. Set `PAYMENT_BATCH_START_DATE` before testing scheduled payment-batch generation locally. `php artisan schedule:work` runs all scheduled tasks, including the cleanup jobs described below.
+
+Configure integrations in your own `.env` only when needed. The dashboard does not require Microsoft Graph or fiscal-service credentials to start. Register PDF uploads explicitly use the `s3` disk: set `AWS_BUCKET` to the actual bucket and configure its credentials and, if applicable, endpoint. `FILESYSTEM_DISK=local` does not redirect these uploads. `AWS_S3_BUCKET` is used by this application as an upload directory/prefix despite its name. Fiscal document storage can use `DFE_S3_BUCKET` and `DFE_S3_PREFIX` for its separate private disk.
+
+## Checks
+
 ```bash
-php artisan serve
+php artisan test --compact
+npm run build
 ```
-Access the application, typically at `http://127.0.0.1:8000`.
 
-## Deployment
+## VPS deployment
 
-This application is currently deployed on a VPS. Deployment steps may vary depending on the server environment (e.g., using Nginx/Apache, Supervisor for queues, ensuring necessary PDF processing libraries are installed on the server, configuring AWS credentials securely). Refer to Laravel deployment documentation for general guidance.
+The application is hosted on a VPS. Point the web server's document root to `public/`, build the frontend assets, apply database migrations, keep a queue worker running under a process supervisor, and configure Laravel's scheduler to run every minute when scheduled workflows are required. Install Poppler and configure S3, Microsoft Graph, and fiscal-service credentials and certificates for the integrations enabled in that environment.
+
+Review scheduled jobs before enabling the scheduler: they include payment-batch generation and retention cleanup. Set `PAYMENT_BATCH_START_DATE` for payment processing. The register cleanup job removes paid or cancelled records older than 15 days, along with their S3 files. Other retention jobs remove eligible resolved email-integration inbox items older than 30 days and confirmed payment batches older than 90 days.
