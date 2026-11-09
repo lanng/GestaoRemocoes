@@ -53,7 +53,7 @@ class EditRejectedMdfeDocument
             'cte_document_ids' => $document->cteDocuments()->orderByPivot('position')->pluck('cte_documents.id')->all(),
             'ciot_mode' => 'existing',
             'ciot_id' => $document->ciot_id,
-            'driver_id' => MdfeDriver::query()->where('cpf', $driverCpf)->where('is_active', true)->value('id'),
+            'driver_id' => MdfeDriver::query()->where('cpf', $driverCpf)->where('line', $snapshot['line'] ?? $document->ciot?->line?->value)->where('is_active', true)->value('id'),
             'endorsements' => array_map(fn (string $number): array => ['number' => $number], $snapshot['insurance']['endorsements'] ?? []),
             'route_ufs' => $snapshot['route_ufs'] ?? [],
             'homologation_fixture' => ($snapshot['insurance']['source'] ?? null) === 'homologation_fixture',
@@ -74,7 +74,10 @@ class EditRejectedMdfeDocument
             'cte_document_ids' => ['required', 'array', 'min:1'],
             'cte_document_ids.*' => ['required', 'integer', 'distinct'],
             'new_ciot' => ['required', 'array'],
+            'driver_id' => ['required', 'integer'],
         ])->validate();
+
+        $this->selectedDriver(CiotLineEnum::from($data['line']), (int) $data['driver_id']);
 
         $selectedIds = collect($data['cte_document_ids'])->map(fn (int|string $id): int => (int) $id);
         $documents = CteDocument::query()->whereIn('id', $selectedIds)->orderBy('id')->get();
@@ -109,7 +112,7 @@ class EditRejectedMdfeDocument
                 'endorsements' => ['required', 'array', 'min:1'],
                 'endorsements.*.number' => ['required', 'string', 'max:40'],
                 'route_ufs' => ['present', 'array'],
-                'driver_id' => ['required_if:line,tank_alcohol', 'nullable', 'integer'],
+                'driver_id' => ['required', 'integer'],
             ])->validate();
             $selectedIds = collect($data['cte_document_ids'])->map(fn (int|string $id): int => (int) $id);
             $documents = CteDocument::query()->whereIn('id', $selectedIds)->orderBy('id')->lockForUpdate()->get();
@@ -125,12 +128,7 @@ class EditRejectedMdfeDocument
             if ($line->value !== $data['line']) {
                 throw new DomainException('A modalidade deve corresponder aos CT-es e ao CIOT selecionados.');
             }
-            $driver = $line === CiotLineEnum::TankAlcohol
-                ? MdfeDriver::query()->whereKey($data['driver_id'])->where('is_active', true)->where('line', $line->value)->first()
-                : null;
-            if ($line === CiotLineEnum::TankAlcohol && $driver === null) {
-                throw new DomainException('Selecione um motorista ativo para o MDF-e de álcool.');
-            }
+            $driver = $this->selectedDriver($line, (int) $data['driver_id']);
             $endorsements = array_values(array_unique(array_map(fn (array $row): string => trim($row['number']), $data['endorsements'])));
             $fixture = ($data['homologation_fixture'] ?? false) ? [
                 'insurer_name' => $data['fixture_insurer_name'] ?? '',
@@ -156,9 +154,7 @@ class EditRejectedMdfeDocument
                 $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle($endorsements, $fixture);
             }
             $snapshot['route_ufs'] = $data['route_ufs'];
-            if ($driver !== null) {
-                $snapshot['vehicle']['drivers'] = [['name' => $driver->name, 'cpf' => $driver->cpf]];
-            }
+            $snapshot['vehicle']['drivers'] = [['name' => $driver->name, 'cpf' => $driver->cpf]];
             $snapshot = $this->validateSnapshot($snapshot);
             app(BuildMdfeXml::class)->handle($snapshot, (int) $locked->mdfe_number, (int) $locked->series);
             $snapshot['last_rejected_attempt'] ??= $this->rejectedAttempt($locked);
@@ -198,6 +194,20 @@ class EditRejectedMdfeDocument
 
             return $locked->refresh();
         }, attempts: 3);
+    }
+
+    private function selectedDriver(CiotLineEnum $line, int $driverId): MdfeDriver
+    {
+        $driver = MdfeDriver::query()
+            ->where('is_active', true)
+            ->where('line', $line->value)
+            ->find($driverId);
+
+        if ($driver === null) {
+            throw new DomainException('Selecione um motorista ativo para o MDF-e de '.$line->label().'.');
+        }
+
+        return $driver;
     }
 
     private function assertConfirmedRejection(MdfeDocument $document): void

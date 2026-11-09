@@ -317,15 +317,15 @@ class BuildMdfeEmissionSnapshot
             }
         }
 
-        if ($line === CiotLineEnum::VehicleRemoval->value) {
+        $driver = $selectedDriver;
+
+        if ($driver === null && $line === CiotLineEnum::VehicleRemoval->value) {
             $driver = MdfeDriver::query()->where('line', $line)->where('is_active', true)->where('is_default', true)->first();
-        } else {
-            $driver = $selectedDriver;
         }
 
         if (! $driver instanceof MdfeDriver || ! $driver->is_active || $driver->line !== $line) {
             throw new DomainException($line === CiotLineEnum::VehicleRemoval->value
-                ? 'Cadastre um motorista ativo padrão para a linha de remoção de veículos.'
+                ? 'Selecione um motorista ativo cadastrado para a linha de remoção de veículos.'
                 : 'Selecione um motorista ativo cadastrado para a linha de tanque de álcool.');
         }
 

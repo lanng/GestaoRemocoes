@@ -366,14 +366,10 @@ class PrepareMdfeDocument
         ));
     }
 
-    private function driver(CiotLineEnum $line, mixed $driverId): ?MdfeDriver
+    private function driver(CiotLineEnum $line, mixed $driverId): MdfeDriver
     {
-        if ($line !== CiotLineEnum::TankAlcohol) {
-            return null;
-        }
-
         if (! is_int($driverId) && (! is_string($driverId) || ! ctype_digit($driverId))) {
-            throw new DomainException('Selecione um motorista ativo para o MDF-e de álcool.');
+            throw new DomainException('Selecione um motorista ativo para o MDF-e de '.$line->label().'.');
         }
 
         $driver = MdfeDriver::query()
@@ -382,7 +378,7 @@ class PrepareMdfeDocument
             ->find((int) $driverId);
 
         if ($driver === null) {
-            throw new DomainException('Selecione um motorista ativo para o MDF-e de álcool.');
+            throw new DomainException('Selecione um motorista ativo para o MDF-e de '.$line->label().'.');
         }
 
         return $driver;

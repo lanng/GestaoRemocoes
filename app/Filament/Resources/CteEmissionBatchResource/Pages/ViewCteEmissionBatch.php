@@ -90,15 +90,21 @@ class ViewCteEmissionBatch extends ViewRecord
 
     private function defaultDirectMdfeDriverId(mixed $ciotId): ?int
     {
-        if ($this->selectedDirectMdfeCiot($ciotId)?->line !== CiotLineEnum::TankAlcohol) {
+        $line = $this->selectedDirectMdfeCiot($ciotId)?->line;
+
+        if ($line === null) {
             return null;
         }
 
         $drivers = MdfeDriver::query()
-            ->where('line', CiotLineEnum::TankAlcohol->value)
+            ->where('line', $line->value)
             ->where('is_active', true)
             ->orderBy('name')
-            ->get(['id']);
+            ->get(['id', 'is_default']);
+
+        if ($line === CiotLineEnum::VehicleRemoval) {
+            return $drivers->firstWhere('is_default', true)?->id;
+        }
 
         return $drivers->count() === 1 ? (int) $drivers->first()->id : null;
     }
@@ -344,16 +350,17 @@ class ViewCteEmissionBatch extends ViewRecord
                         ->defaultItems(1),
                     Select::make('driver_id')
                         ->label('Motorista')
-                        ->options(fn (): array => MdfeDriver::query()
-                            ->where('line', CiotLineEnum::TankAlcohol->value)
+                        ->options(fn (Get $get): array => MdfeDriver::query()
+                            ->where('line', $this->selectedDirectMdfeCiot($get('ciot_id'))?->line?->value)
                             ->where('is_active', true)
                             ->orderBy('name')
                             ->pluck('name', 'id')
                             ->all())
                         ->default(fn (Get $get): ?int => $this->defaultDirectMdfeDriverId($get('ciot_id')))
                         ->searchable()
-                        ->required(fn (\Filament\Forms\Get $get): bool => $this->selectedDirectMdfeCiot($get('ciot_id'))?->line === CiotLineEnum::TankAlcohol)
-                        ->visible(fn (\Filament\Forms\Get $get): bool => $this->selectedDirectMdfeCiot($get('ciot_id'))?->line === CiotLineEnum::TankAlcohol),
+                        ->required()
+                        ->visible(fn (Get $get): bool => $this->selectedDirectMdfeCiot($get('ciot_id')) !== null)
+                        ->helperText('A escolha vale apenas para este MDF-e e não altera o motorista fixo do cadastro.'),
                     Toggle::make('homologation_fixture')
                         ->label('Usar dados sintéticos de seguro para homologação')
                         ->helperText('Disponível apenas no ambiente de homologação; não salva esses dados na configuração.')
@@ -393,13 +400,22 @@ class ViewCteEmissionBatch extends ViewRecord
                     ] : null;
 
                     try {
+                        $driver = MdfeDriver::query()
+                            ->where('is_active', true)
+                            ->where('line', $ciot->line->value)
+                            ->find($data['driver_id'] ?? null);
+
+                        if ($driver === null) {
+                            throw new DomainException('Selecione um motorista ativo para o MDF-e de '.$ciot->line->label().'.');
+                        }
+
                         $document = app(QueueDirectMdfeEmission::class)->handleForDocuments(
                             documents: $this->record->documents()->get(),
                             ciot: $ciot,
                             endorsements: collect($data['endorsements'] ?? [])->pluck('number')->all(),
                             routeUfs: [],
                             batch: $this->record,
-                            driver: isset($data['driver_id']) ? MdfeDriver::query()->findOrFail($data['driver_id']) : null,
+                            driver: $driver,
                             homologationFixture: $fixture,
                         );
                     } catch (DomainException $exception) {

@@ -101,8 +101,8 @@ class CreateMdfeDocument extends Page implements HasForms
                             ->afterStateUpdated(function (Set $set, ?string $state): void {
                                 $set('cte_document_ids', []);
                                 $set('ciot_id', null);
-                                $set('driver_id', null);
                                 $line = CiotLineEnum::tryFrom((string) $state);
+                                $set('driver_id', $line === null ? null : $this->defaultDriverId($line));
                                 $set('new_ciot', $line === null ? [] : $this->defaultNewCiotData($line));
                                 $this->prefillWarnings = [];
                                 $this->routeRanking = '';
@@ -184,16 +184,17 @@ class CreateMdfeDocument extends Page implements HasForms
                             ->required()
                             ->columnSpanFull(),
                         Select::make('driver_id')
-                            ->label('Motorista do MDF-e de álcool')
-                            ->options(fn (): array => MdfeDriver::query()
-                                ->where('line', CiotLineEnum::TankAlcohol->value)
+                            ->label('Motorista do MDF-e')
+                            ->options(fn (Get $get): array => MdfeDriver::query()
+                                ->where('line', $get('line'))
                                 ->where('is_active', true)
                                 ->orderBy('name')
                                 ->pluck('name', 'id')
                                 ->all())
                             ->searchable()
-                            ->required(fn (Get $get): bool => $get('line') === CiotLineEnum::TankAlcohol->value)
-                            ->visible(fn (Get $get): bool => $get('line') === CiotLineEnum::TankAlcohol->value)
+                            ->required()
+                            ->visible(fn (Get $get): bool => CiotLineEnum::tryFrom((string) $get('line')) !== null)
+                            ->helperText('A escolha vale apenas para este MDF-e e não altera o motorista fixo do cadastro.')
                             ->columnSpanFull(),
                         Select::make('route_ufs')
                             ->label('UFs de percurso, se houver')
@@ -240,6 +241,10 @@ class CreateMdfeDocument extends Page implements HasForms
                 'data.cte_document_ids' => $exception->getMessage(),
             ]);
         } catch (ValidationException $exception) {
+            if (collect(array_keys($exception->errors()))->contains(fn (string $key): bool => str_starts_with($key, 'data.'))) {
+                throw $exception;
+            }
+
             throw ValidationException::withMessages(collect($exception->errors())->mapWithKeys(
                 fn (array $messages, string $key): array => ['data.'.$key => $messages],
             )->all());
@@ -440,15 +445,15 @@ class CreateMdfeDocument extends Page implements HasForms
 
     private function defaultDriverId(CiotLineEnum $line): ?int
     {
-        if ($line !== CiotLineEnum::TankAlcohol) {
-            return null;
-        }
-
         $drivers = MdfeDriver::query()
             ->where('line', $line->value)
             ->where('is_active', true)
             ->orderBy('name')
-            ->get(['id']);
+            ->get(['id', 'is_default']);
+
+        if ($line === CiotLineEnum::VehicleRemoval) {
+            return $drivers->firstWhere('is_default', true)?->id;
+        }
 
         return $drivers->count() === 1 ? (int) $drivers->first()->id : null;
     }

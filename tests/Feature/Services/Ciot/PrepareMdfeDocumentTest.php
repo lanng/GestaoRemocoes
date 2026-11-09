@@ -13,6 +13,7 @@ use App\Models\Company;
 use App\Models\CteDocument;
 use App\Models\CteEmissionBatch;
 use App\Models\MdfeDocument;
+use App\Models\MdfeDriver;
 use App\Services\Ciot\PrepareMdfeDocument;
 use App\Services\Ciot\QueueDirectMdfeEmission;
 use DomainException;
@@ -25,6 +26,8 @@ use Tests\TestCase;
 class PrepareMdfeDocumentTest extends TestCase
 {
     use RefreshDatabase;
+
+    private MdfeDriver $driver;
 
     protected function setUp(): void
     {
@@ -40,6 +43,8 @@ class PrepareMdfeDocumentTest extends TestCase
             'dfe.tp_amb' => '2',
             'dfe.emit.cnpj' => '12563112000130',
         ]);
+
+        $this->driver = MdfeDriver::factory()->create();
     }
 
     public function test_ignores_legacy_plate_override_before_validating_the_selected_ctes(): void
@@ -48,6 +53,54 @@ class PrepareMdfeDocumentTest extends TestCase
         $this->expectExceptionMessage('Selecione ao menos um CT-e autorizado.');
 
         app(PrepareMdfeDocument::class)->handle(['vehicle_plate' => 'INVALID']);
+    }
+
+    public function test_preparation_passes_the_selected_removal_driver_to_the_mdfe_queue(): void
+    {
+        $document = $this->controlledVehicleDocument();
+        $ciot = Ciot::factory()->issued()->create();
+        $selected = MdfeDriver::factory()->create();
+        $mdfe = MdfeDocument::factory()->create(['ciot_id' => $ciot->id]);
+        $this->mock(QueueDirectMdfeEmission::class)
+            ->shouldReceive('handleForDocuments')->once()
+            ->withArgs(fn ($documents, $chosenCiot, $endorsements, $routeUfs, $batch, $driver): bool => $driver?->is($selected) === true)
+            ->andReturn($mdfe);
+
+        $result = app(PrepareMdfeDocument::class)->handle([
+            'cte_document_ids' => [$document->id],
+            'ciot_mode' => 'existing',
+            'ciot_id' => $ciot->id,
+            'driver_id' => $selected->id,
+            'endorsements' => [['number' => 'AVER-001']],
+        ]);
+
+        $this->assertTrue($result->mdfe->is($mdfe));
+    }
+
+    public function test_preparation_rejects_missing_or_invalid_removal_drivers_before_any_ciot_emission(): void
+    {
+        Http::fake();
+        $document = $this->controlledVehicleDocument();
+        MdfeDriver::factory()->create(['is_default' => true]);
+        $inactive = MdfeDriver::factory()->create(['is_active' => false]);
+        $tankDriver = MdfeDriver::factory()->create(['line' => 'tank_alcohol']);
+
+        foreach ([null, 999999, $inactive->id, $tankDriver->id] as $driverId) {
+            try {
+                app(PrepareMdfeDocument::class)->handle([
+                    'cte_document_ids' => [$document->id],
+                    'ciot_mode' => 'new',
+                    'driver_id' => $driverId,
+                    'endorsements' => [['number' => 'AVER-001']],
+                ]);
+                $this->fail('A preparação deve exigir um motorista ativo da modalidade selecionada.');
+            } catch (DomainException $exception) {
+                $this->assertStringContainsString('motorista ativo', $exception->getMessage());
+            }
+        }
+
+        Http::assertNothingSent();
+        $this->assertDatabaseCount('ciots', 0);
     }
 
     public function test_it_emits_a_new_ciot_before_queuing_the_mdfe(): void
@@ -83,6 +136,7 @@ class PrepareMdfeDocumentTest extends TestCase
         $result = app(PrepareMdfeDocument::class)->handle([
             'cte_document_ids' => [$document->id],
             'ciot_mode' => 'new',
+            'driver_id' => $this->driver->id,
             'new_ciot' => $this->newCiotFormData($payer, $tractor),
             'endorsements' => [['number' => 'AVERBACAO-001']],
         ]);
@@ -123,6 +177,7 @@ class PrepareMdfeDocumentTest extends TestCase
         $result = app(PrepareMdfeDocument::class)->handle([
             'cte_document_ids' => [$document->id],
             'ciot_mode' => 'new',
+            'driver_id' => $this->driver->id,
             'new_ciot' => $this->newCiotFormData($payer, $tractor),
             'endorsements' => [['number' => 'AVERBACAO-001']],
         ]);
@@ -152,6 +207,7 @@ class PrepareMdfeDocumentTest extends TestCase
             app(PrepareMdfeDocument::class)->handle([
                 'cte_document_ids' => [$document->id],
                 'ciot_mode' => 'new',
+                'driver_id' => $this->driver->id,
                 'new_ciot' => $this->newCiotFormData($payer, $tractor),
                 'endorsements' => [['number' => 'AVERBACAO-001']],
             ]);

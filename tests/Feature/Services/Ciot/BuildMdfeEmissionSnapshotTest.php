@@ -11,6 +11,7 @@ use App\Models\CteDocument;
 use App\Models\CteEmissionBatch;
 use App\Models\MdfeDriver;
 use App\Services\Ciot\BuildMdfeEmissionSnapshot;
+use App\Services\Ciot\PrepareMdfeDocument;
 use App\Services\Ciot\QueueDirectMdfeEmission;
 use DomainException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -99,6 +100,80 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
             'bank_code' => '033',
             'bank_agency' => '0073',
         ], $snapshot['payment']);
+    }
+
+    public function test_removal_snapshot_uses_the_selected_driver_instead_of_the_fixed_driver(): void
+    {
+        [$batch] = $this->makeTrip();
+        CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55', 'tare_kg' => 8000, 'type_rod' => '03', 'body_type' => '00', 'uf' => 'SP',
+        ]);
+        $fixed = MdfeDriver::factory()->create(['is_default' => true]);
+        $selected = MdfeDriver::factory()->create();
+
+        $snapshot = app(BuildMdfeEmissionSnapshot::class)->handle($batch, ['AVER-001'], [], $selected);
+
+        $this->assertSame([['name' => $selected->name, 'cpf' => $selected->cpf]], $snapshot['vehicle']['drivers']);
+        $this->assertTrue($fixed->fresh()->is_default);
+        $this->assertFalse($selected->fresh()->is_default);
+    }
+
+    public function test_removal_snapshot_accepts_a_selected_driver_without_any_fixed_driver(): void
+    {
+        [$batch] = $this->makeTrip();
+        CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55', 'tare_kg' => 8000, 'type_rod' => '03', 'body_type' => '00', 'uf' => 'SP',
+        ]);
+        $selected = MdfeDriver::factory()->create();
+
+        $snapshot = app(BuildMdfeEmissionSnapshot::class)->handle($batch, ['AVER-001'], [], $selected);
+
+        $this->assertSame($selected->cpf, $snapshot['vehicle']['drivers'][0]['cpf']);
+    }
+
+    public function test_removal_snapshot_does_not_replace_an_invalid_selection_with_the_fixed_driver(): void
+    {
+        [$batch] = $this->makeTrip();
+        CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55', 'tare_kg' => 8000, 'type_rod' => '03', 'body_type' => '00', 'uf' => 'SP',
+        ]);
+        MdfeDriver::factory()->create(['is_default' => true]);
+
+        foreach ([['is_active' => false], ['line' => 'tank_alcohol']] as $attributes) {
+            $invalid = MdfeDriver::factory()->create($attributes);
+
+            try {
+                app(BuildMdfeEmissionSnapshot::class)->handle($batch, ['AVER-001'], [], $invalid);
+                $this->fail('Um motorista inválido não pode ser substituído silenciosamente pelo fixo.');
+            } catch (DomainException $exception) {
+                $this->assertStringContainsString('motorista', $exception->getMessage());
+            }
+        }
+    }
+
+    public function test_removal_preparation_persists_the_selected_driver_independently_of_later_default_changes(): void
+    {
+        Queue::fake();
+        [$batch, $ciot] = $this->makeTrip();
+        CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55', 'tare_kg' => 8000, 'type_rod' => '03', 'body_type' => '00', 'uf' => 'SP',
+        ]);
+        $fixed = MdfeDriver::factory()->create(['is_default' => true]);
+        $selected = MdfeDriver::factory()->create();
+
+        $result = app(PrepareMdfeDocument::class)->handle([
+            'cte_document_ids' => $batch->documents()->pluck('id')->all(),
+            'ciot_mode' => 'existing',
+            'ciot_id' => $ciot->id,
+            'driver_id' => $selected->id,
+            'endorsements' => [['number' => 'AVER-001']],
+        ], $batch);
+
+        $this->assertSame($selected->cpf, $result->mdfe->snapshot['vehicle']['drivers'][0]['cpf']);
+        $this->assertTrue($fixed->fresh()->is_default);
+        MdfeDriver::factory()->create(['is_default' => true]);
+        $this->assertSame($selected->cpf, $result->mdfe->fresh()->snapshot['vehicle']['drivers'][0]['cpf']);
+        Queue::assertPushed(EmitMdfeDirectJob::class);
     }
 
     public function test_mismatched_ciot_origin_is_rejected_before_mdfe_queue_and_reservation(): void

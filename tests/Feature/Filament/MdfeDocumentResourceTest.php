@@ -180,6 +180,60 @@ class MdfeDocumentResourceTest extends TestCase
             ->assertSet('data.driver_id', $driver->id);
     }
 
+    public function test_removal_driver_selector_suggests_the_fixed_driver_and_allows_an_override(): void
+    {
+        $fixed = MdfeDriver::factory()->create(['is_default' => true]);
+        $alternative = MdfeDriver::factory()->create();
+        MdfeDriver::factory()->create(['is_active' => false]);
+        $tankDriver = MdfeDriver::factory()->create(['line' => 'tank_alcohol']);
+
+        Livewire::test(CreateMdfeDocument::class)
+            ->set('data.line', 'vehicle_removal')
+            ->assertFormFieldIsVisible('driver_id')
+            ->assertFormFieldExists('driver_id', fn ($field): bool => $field->isRequired()
+                && count($field->getOptions()) === 2
+                && isset($field->getOptions()[$fixed->id], $field->getOptions()[$alternative->id]))
+            ->assertSet('data.driver_id', $fixed->id)
+            ->set('data.driver_id', $alternative->id)
+            ->set('data.cte_document_ids', [])
+            ->assertSet('data.driver_id', $alternative->id)
+            ->set('data.line', 'tank_alcohol')
+            ->assertSet('data.driver_id', $tankDriver->id)
+            ->assertFormFieldExists('driver_id', fn ($field): bool => array_keys($field->getOptions()) === [$tankDriver->id]);
+
+        $this->assertTrue($fixed->fresh()->is_default);
+        $this->assertFalse($alternative->fresh()->is_default);
+    }
+
+    public function test_removal_without_a_fixed_driver_requires_an_explicit_selection(): void
+    {
+        $driver = MdfeDriver::factory()->create();
+
+        Livewire::test(CreateMdfeDocument::class)
+            ->set('data.line', 'vehicle_removal')
+            ->assertSet('data.driver_id', null)
+            ->assertFormFieldIsVisible('driver_id')
+            ->assertFormFieldExists('driver_id', fn ($field): bool => isset($field->getOptions()[$driver->id]))
+            ->call('prepare')
+            ->assertHasFormErrors(['driver_id' => 'required']);
+    }
+
+    public function test_removal_batch_preparation_suggests_its_fixed_driver(): void
+    {
+        $fixed = MdfeDriver::factory()->create(['is_default' => true]);
+        $batch = CteEmissionBatch::factory()->create(['status' => 'completed']);
+        CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => ['line' => 'vehicle_removal'],
+        ]);
+
+        Livewire::withQueryParams(['batch' => $batch->id])
+            ->test(CreateMdfeDocument::class)
+            ->assertSet('data.line', 'vehicle_removal')
+            ->assertSet('data.driver_id', $fixed->id);
+    }
+
     public function test_create_page_prefills_the_configured_endorsement_and_keeps_an_operator_override(): void
     {
         config(['dfe.mdfe.default_endorsement' => 'AVERBACAO-PADRAO']);
@@ -259,6 +313,8 @@ class MdfeDocumentResourceTest extends TestCase
 
     public function test_new_ciot_vehicle_selection_starts_empty_and_keeps_each_vehicle_independent(): void
     {
+        MdfeDriver::factory()->create(['is_default' => true]);
+        $driver = MdfeDriver::factory()->create();
         $firstVehicle = CiotVehicle::factory()->forRemoval()->create(['plate' => 'BWK4B95']);
         $secondVehicle = CiotVehicle::factory()->forRemoval()->create(['plate' => 'KWP5A14']);
         $cte = CteDocument::factory()->authorized()->create([
@@ -284,6 +340,7 @@ class MdfeDocumentResourceTest extends TestCase
 
         $page = Livewire::test(CreateMdfeDocument::class)
             ->set('data.line', 'vehicle_removal')
+            ->set('data.driver_id', $driver->id)
             ->set('data.cte_document_ids', [$cte->id])
             ->set('data.ciot_mode', 'new');
 
@@ -296,6 +353,7 @@ class MdfeDocumentResourceTest extends TestCase
         $page->set('data.cte_document_ids', [$otherCte->id]);
 
         $this->assertSame([$firstVehicle->id], $page->get('data.new_ciot.vehicle_ids'));
+        $this->assertSame($driver->id, $page->get('data.driver_id'));
 
         $page->set('data.new_ciot.vehicle_ids', [$secondVehicle->id]);
 
@@ -448,6 +506,7 @@ class MdfeDocumentResourceTest extends TestCase
 
     public function test_create_page_rejects_a_legacy_cte_even_if_its_id_is_submitted_manually(): void
     {
+        $driver = MdfeDriver::factory()->create();
         $legacy = CteDocument::factory()->authorized()->create([
             'workflow_origin' => null,
             'access_key' => str_repeat('7', 44),
@@ -463,6 +522,7 @@ class MdfeDocumentResourceTest extends TestCase
                 'cte_document_ids' => [$legacy->id],
                 'ciot_mode' => 'existing',
                 'ciot_id' => $ciot->id,
+                'driver_id' => $driver->id,
             ])
             ->set('data.endorsements', ['test-row' => ['number' => 'AVERBACAO-001']])
             ->call('prepare');

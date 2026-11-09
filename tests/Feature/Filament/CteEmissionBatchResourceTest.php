@@ -440,6 +440,7 @@ class CteEmissionBatchResourceTest extends TestCase
         Queue::fake();
         $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
         $ciot = Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        $driver = MdfeDriver::factory()->create();
         CteDocument::factory()->authorized()->create([
             'cte_emission_batch_id' => $batch->id,
             'workflow_origin' => 'controlled_v1',
@@ -452,7 +453,7 @@ class CteEmissionBatchResourceTest extends TestCase
 
         Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
             ->mountAction('emitMdfeDirect')
-            ->setActionData(['ciot_id' => $ciot->id, 'endorsements' => [['number' => 'AVERBACAO-TEST']]])
+            ->setActionData(['ciot_id' => $ciot->id, 'driver_id' => $driver->id, 'endorsements' => [['number' => 'AVERBACAO-TEST']]])
             ->callMountedAction()
             ->assertNotified('MDF-e não foi enfileirado');
 
@@ -522,6 +523,89 @@ class CteEmissionBatchResourceTest extends TestCase
             ->mountAction('emitMdfeDirect')
             ->assertSet('mountedActionsData.0.ciot_id', $ciot->id)
             ->assertSet('mountedActionsData.0.driver_id', $driver->id);
+    }
+
+    public function test_direct_removal_mdfe_suggests_the_fixed_driver_but_passes_the_selected_driver(): void
+    {
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+        $ciot = Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => ['line' => 'vehicle_removal'],
+        ]);
+        $fixed = MdfeDriver::factory()->create(['is_default' => true]);
+        $selected = MdfeDriver::factory()->create();
+        MdfeDriver::factory()->create(['is_active' => false]);
+        MdfeDriver::factory()->create(['line' => 'tank_alcohol']);
+        $mdfe = MdfeDocument::factory()->create(['cte_emission_batch_id' => null]);
+        $this->mock(QueueDirectMdfeEmission::class)
+            ->shouldReceive('handleForDocuments')->once()
+            ->withArgs(fn ($documents, $chosenCiot, $endorsements, $routeUfs, $chosenBatch, $driver): bool => $driver->is($selected))
+            ->andReturn($mdfe);
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->mountAction('emitMdfeDirect')
+            ->assertSet('mountedActionsData.0.driver_id', $fixed->id)
+            ->assertFormFieldIsVisible('driver_id', 'mountedActionForm')
+            ->assertFormFieldExists('driver_id', 'mountedActionForm', fn ($field): bool => count($field->getOptions()) === 2)
+            ->setActionData([
+                'ciot_id' => $ciot->id,
+                'driver_id' => $selected->id,
+                'endorsements' => [['number' => 'AVER-001']],
+            ])
+            ->callMountedAction()
+            ->assertHasNoActionErrors();
+
+        $this->assertTrue($fixed->fresh()->is_default);
+        $this->assertFalse($selected->fresh()->is_default);
+    }
+
+    public function test_direct_removal_mdfe_requires_a_driver_without_a_fixed_suggestion(): void
+    {
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'workflow_origin' => 'controlled_v1',
+        ]);
+        MdfeDriver::factory()->create();
+
+        Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+            ->mountAction('emitMdfeDirect')
+            ->assertSet('mountedActionsData.0.driver_id', null)
+            ->assertFormFieldIsVisible('driver_id', 'mountedActionForm')
+            ->setActionData(['endorsements' => [['number' => 'AVER-001']]])
+            ->callMountedAction()
+            ->assertHasActionErrors(['driver_id' => 'required']);
+    }
+
+    public function test_direct_removal_mdfe_rejects_inactive_or_other_line_driver_selections(): void
+    {
+        Queue::fake();
+        $batch = CteEmissionBatch::factory()->create(['status' => CteEmissionBatchStatusEnum::COMPLETED]);
+        Ciot::factory()->issued()->create(['cte_emission_batch_id' => $batch->id]);
+        CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => $batch->id,
+            'workflow_origin' => 'controlled_v1',
+        ]);
+        MdfeDriver::factory()->create(['is_default' => true]);
+
+        foreach ([['is_active' => false], ['line' => 'tank_alcohol']] as $attributes) {
+            $invalid = MdfeDriver::factory()->create($attributes);
+
+            Livewire::test(ViewCteEmissionBatch::class, ['record' => $batch->id])
+                ->mountAction('emitMdfeDirect')
+                ->setActionData([
+                    'driver_id' => $invalid->id,
+                    'endorsements' => [['number' => 'AVER-001']],
+                ])
+                ->callMountedAction()
+                ->assertNotified('MDF-e não foi enfileirado');
+        }
+
+        $this->assertDatabaseCount('mdfe_documents', 0);
+        Queue::assertNothingPushed();
     }
 
     public function test_the_documents_table_shows_the_latest_cte_emission_failure_reason(): void

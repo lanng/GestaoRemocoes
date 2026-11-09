@@ -460,7 +460,8 @@ class EditRejectedMdfeDocumentTest extends TestCase
         Filament::setCurrentPanel(Filament::getPanel('admin'));
         $this->actingAs(User::factory()->create());
         $source = $this->rejected();
-        $driver = MdfeDriver::factory()->create(['line' => CiotLineEnum::TankAlcohol->value, 'cpf' => '12345678909']);
+        $driver = MdfeDriver::query()->where('cpf', '12345678909')->firstOrFail();
+        $driver->update(['line' => CiotLineEnum::TankAlcohol->value]);
         $source->ciot->forceFill(['line' => CiotLineEnum::TankAlcohol])->save();
         $source->cteDocuments->first()->forceFill(['snapshot' => ['line' => CiotLineEnum::TankAlcohol->value]])->save();
         $snapshot = $source->snapshot;
@@ -472,6 +473,86 @@ class EditRejectedMdfeDocumentTest extends TestCase
         $this->assertSame($driver->name, $source->fresh()->snapshot['vehicle']['drivers'][0]['name']);
         $this->assertSame('280', $source->fresh()->mdfe_number);
         Queue::assertNothingPushed();
+    }
+
+    public function test_rejected_removal_manifest_keeps_its_saved_driver_and_allows_changing_only_that_manifest(): void
+    {
+        Filament::setCurrentPanel(Filament::getPanel('admin'));
+        $this->actingAs(User::factory()->create());
+        $source = $this->rejected();
+        $saved = MdfeDriver::query()->where('cpf', '12345678909')->firstOrFail();
+        $fixed = MdfeDriver::factory()->create(['is_default' => true]);
+        $selected = MdfeDriver::factory()->create();
+
+        Livewire::test(EditMdfeDocument::class, ['record' => $source->getRouteKey()])
+            ->assertFormFieldIsVisible('driver_id')
+            ->assertSet('data.driver_id', $saved->id)
+            ->set('data.driver_id', $selected->id)
+            ->call('save')
+            ->assertHasNoFormErrors()
+            ->assertRedirect();
+
+        $this->assertSame([['name' => $selected->name, 'cpf' => $selected->cpf]], $source->fresh()->snapshot['vehicle']['drivers']);
+        $this->assertSame('280', $source->fresh()->mdfe_number);
+        $this->assertTrue($fixed->fresh()->is_default);
+        $this->assertFalse($selected->fresh()->is_default);
+        Queue::assertNothingPushed();
+        Http::assertNothingSent();
+    }
+
+    public function test_rejected_removal_manifest_rejects_a_driver_from_another_line_or_inactive(): void
+    {
+        $source = $this->rejected();
+        $service = app(EditRejectedMdfeDocument::class);
+
+        foreach ([['is_active' => false], ['line' => 'tank_alcohol']] as $attributes) {
+            $driver = MdfeDriver::factory()->create($attributes);
+            $data = $service->formData($source);
+            $data['driver_id'] = $driver->id;
+
+            try {
+                $service->save($source, $data);
+                $this->fail('A edição deve rejeitar um motorista inativo ou de outra modalidade.');
+            } catch (DomainException $exception) {
+                $this->assertStringContainsString('motorista ativo', $exception->getMessage());
+            }
+        }
+    }
+
+    public function test_replacement_ciot_is_not_created_or_emitted_with_an_invalid_driver(): void
+    {
+        config([
+            'ciot.api_key' => 'test-api-key',
+            'ciot.base_url' => 'https://antt-hml.test/pefServices',
+            'ciot.company.cnpj' => '12563112000130',
+            'ciot.company.rntrc' => '45963122',
+            'ciot.lines.vehicle_removal.bank_code' => '756',
+            'ciot.lines.vehicle_removal.bank_agency' => '0001',
+        ]);
+        $source = $this->rejected();
+        $service = app(EditRejectedMdfeDocument::class);
+        $payer = Company::factory()->create(['cnpj' => '14517191000925']);
+        $vehicle = CiotVehicle::factory()->forRemoval()->create(['plate' => 'PUC8E55']);
+        $this->fakeAnttAcceptingTheDeclaration('520032959999');
+        $ciotCount = Ciot::query()->count();
+
+        foreach ([['is_active' => false], ['line' => 'tank_alcohol']] as $attributes) {
+            $driver = MdfeDriver::factory()->create($attributes);
+            $data = $service->formData($source);
+            $data['ciot_mode'] = 'new';
+            $data['driver_id'] = $driver->id;
+            $data['new_ciot'] = $this->newCiotFormData($payer, $vehicle);
+
+            try {
+                $service->createAndEmitReplacementCiot($source, $data);
+                $this->fail('O motorista deve ser validado antes de criar ou emitir o CIOT substituto.');
+            } catch (DomainException $exception) {
+                $this->assertStringContainsString('motorista ativo', $exception->getMessage());
+            }
+
+            $this->assertDatabaseCount('ciots', $ciotCount);
+            Http::assertNothingSent();
+        }
     }
 
     private function authorizedCte(?int $batchId = null): CteDocument
@@ -487,6 +568,7 @@ class EditRejectedMdfeDocumentTest extends TestCase
 
     private function rejected(bool $withBatch = false): MdfeDocument
     {
+        MdfeDriver::factory()->create(['name' => 'Motorista Fixture', 'cpf' => '12345678909']);
         $batch = $withBatch ? CteEmissionBatch::factory()->create([
             'status' => CteEmissionBatchStatusEnum::COMPLETED,
             'execution_mode' => 'live',
