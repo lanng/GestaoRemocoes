@@ -70,12 +70,80 @@ class CreateGeneralCargoCteDocumentTest extends TestCase
     public function test_keeps_explicit_peso_bruto_as_a_measured_weight(): void
     {
         $data = $this->data();
-        $data['cargo']['measurements'] = [['unit' => '01', 'measure' => 'PESO BRUTO', 'quantity' => '12000']];
+        $data['cargo']['measurements'] = [['unit' => '01', 'measure' => 'PESO BRUTO', 'quantity' => '12000.4500']];
 
         $document = app(CreateGeneralCargoCteDocument::class)->handle($data);
 
-        $this->assertSame('12000.0000', $document->snapshot['cargo']['weight_kg']);
-        $this->assertSame('12000.0000', $document->snapshot['cargo_weight_kg']);
+        $this->assertSame('12000.45', $document->snapshot['cargo']['weight_kg']);
+        $this->assertSame('12000.45', $document->snapshot['cargo_weight_kg']);
+    }
+
+    public function test_rejects_cte_avulso_weight_with_meaningful_precision_beyond_two_decimal_places(): void
+    {
+        $data = $this->data();
+        $data['cargo']['measurements'] = [['unit' => '01', 'measure' => 'PESO BRUTO', 'quantity' => '12000.451']];
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('até 2 casas decimais');
+
+        app(CreateGeneralCargoCteDocument::class)->handle($data);
+    }
+
+    public function test_emission_snapshot_validation_rejects_kilogram_measurements_with_meaningful_third_decimal(): void
+    {
+        $data = $this->data();
+        $data['cargo']['measurements'] = [['unit' => '01', 'measure' => 'PESO BRUTO', 'quantity' => '12000.45']];
+        $document = app(CreateGeneralCargoCteDocument::class)->handle($data);
+        $snapshot = $document->snapshot;
+        $snapshot['cargo']['measurements'][0]['quantity'] = '12000.451';
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('até 2 casas decimais');
+
+        app(ValidateGeneralCargoCteSnapshot::class)->handle($snapshot, forEmission: true);
+    }
+
+    public function test_emission_snapshot_validation_rejects_stored_cargo_weight_with_meaningful_third_decimal(): void
+    {
+        $data = $this->data();
+        $data['cargo']['measurements'] = [['unit' => '01', 'measure' => 'PESO BRUTO', 'quantity' => '12000.45']];
+        $document = app(CreateGeneralCargoCteDocument::class)->handle($data);
+        $snapshot = $document->snapshot;
+        $snapshot['cargo']['weight_kg'] = '12000.451';
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('até 2 casas decimais');
+
+        app(ValidateGeneralCargoCteSnapshot::class)->handle($snapshot, forEmission: true);
+    }
+
+    public function test_emission_snapshot_validation_rejects_top_level_cargo_weight_with_meaningful_third_decimal(): void
+    {
+        $data = $this->data();
+        $data['cargo']['measurements'] = [['unit' => '01', 'measure' => 'PESO BRUTO', 'quantity' => '12000.45']];
+        $document = app(CreateGeneralCargoCteDocument::class)->handle($data);
+        $snapshot = $document->snapshot;
+        $snapshot['cargo_weight_kg'] = '12000.451';
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('até 2 casas decimais');
+
+        app(ValidateGeneralCargoCteSnapshot::class)->handle($snapshot, forEmission: true);
+    }
+
+    public function test_emission_snapshot_validation_accepts_kg_values_with_only_trailing_zero_precision(): void
+    {
+        $data = $this->data();
+        $data['cargo']['measurements'] = [['unit' => '01', 'measure' => 'PESO BRUTO', 'quantity' => '12000.45']];
+        $document = app(CreateGeneralCargoCteDocument::class)->handle($data);
+        $snapshot = $document->snapshot;
+        $snapshot['cargo']['measurements'][0]['quantity'] = '12000.4500';
+        $snapshot['cargo']['weight_kg'] = '12000.4500';
+        $snapshot['cargo_weight_kg'] = '12000.4500';
+
+        app(ValidateGeneralCargoCteSnapshot::class)->handle($snapshot, forEmission: true);
+
+        $this->assertTrue(true);
     }
 
     public function test_creates_a_carta_de_remocao_origin_document_without_inventing_number_or_date(): void
@@ -393,6 +461,24 @@ class CreateGeneralCargoCteDocumentTest extends TestCase
         $this->assertSame($original->sha256, $archivedNfe->sha256);
         $this->assertSame($original->extracted_data, $archivedNfe->extracted_data);
         $this->assertSame($xml, Storage::disk('dfe')->get($archivedNfe->xml_path));
+    }
+
+    public function test_rejects_editing_cte_avulso_weight_with_more_than_two_decimal_places(): void
+    {
+        $document = app(CreateGeneralCargoCteDocument::class)->handle($this->data());
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('até 2 casas decimais');
+
+        app(UpdateGeneralCargoCteDraft::class)->handle($document, [
+            'cfop' => '5353',
+            'cargo' => [
+                'value' => '1200.00',
+                'predominant_product' => 'CARGA REVISADA',
+                'other_category' => '',
+                'measurements' => [['unit' => '01', 'measure' => 'PESO ESTIMADO', 'quantity' => '12000.451']],
+            ],
+        ]);
     }
 
     public function test_rejects_measurements_that_are_neither_estimated_kg_nor_transported_units(): void

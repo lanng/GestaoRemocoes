@@ -107,11 +107,19 @@ class CreateGeneralCargoCteDocument
         $cargo = (array) ($data['cargo'] ?? []);
         $freight = (array) ($data['freight'] ?? []);
         $cfop = trim((string) ($data['cfop'] ?? ''));
-        $measurements = array_values(array_map(fn (array $measurement): array => [
-            'unit' => trim((string) ($measurement['unit'] ?? '')),
-            'measure' => trim((string) ($measurement['measure'] ?? '')),
-            'quantity' => $this->decimal((string) ($measurement['quantity'] ?? ''), 4, 'quantidade da carga'),
-        ], (array) ($cargo['measurements'] ?? [])));
+        $measurements = array_values(array_map(function (array $measurement): array {
+            $unit = trim((string) ($measurement['unit'] ?? ''));
+
+            return [
+                'unit' => $unit,
+                'measure' => trim((string) ($measurement['measure'] ?? '')),
+                'quantity' => $this->decimal(
+                    (string) ($measurement['quantity'] ?? ''),
+                    $unit === '01' ? 2 : 4,
+                    'quantidade da carga',
+                ),
+            ];
+        }, (array) ($cargo['measurements'] ?? [])));
         $grossWeight = collect($measurements)->first(fn (array $measurement): bool => $measurement['unit'] === '01'
             && mb_strtoupper($measurement['measure']) === 'PESO BRUTO');
 

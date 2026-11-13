@@ -30,11 +30,19 @@ class UpdateGeneralCargoCteDraft
             $snapshot = (array) $lockedDocument->snapshot;
             $cargo = (array) ($data['cargo'] ?? []);
             $measurements = array_values(array_map(
-                fn (mixed $measurement): array => [
-                    'unit' => trim((string) data_get($measurement, 'unit', '')),
-                    'measure' => trim((string) data_get($measurement, 'measure', '')),
-                    'quantity' => $this->decimal(data_get($measurement, 'quantity', ''), 4, 'quantidade da medida'),
-                ],
+                function (mixed $measurement): array {
+                    $unit = trim((string) data_get($measurement, 'unit', ''));
+
+                    return [
+                        'unit' => $unit,
+                        'measure' => trim((string) data_get($measurement, 'measure', '')),
+                        'quantity' => $this->decimal(
+                            data_get($measurement, 'quantity', ''),
+                            $unit === '01' ? 2 : 4,
+                            'quantidade da medida',
+                        ),
+                    ];
+                },
                 (array) ($cargo['measurements'] ?? []),
             ));
             $grossWeight = collect($measurements)->first(fn (array $measurement): bool => $measurement['unit'] === '01'
