@@ -14,6 +14,7 @@ use App\Services\Ciot\BuildMdfeEmissionSnapshot;
 use App\Services\Ciot\CiotEmissionResult;
 use App\Services\Ciot\CreateCiotForBatch;
 use App\Services\Ciot\EmitCiotDeclaration;
+use App\Services\Ciot\ResolveGeneralCargoMdfeCargo;
 use App\Services\Ciot\ValidateMdfeDocumentSelection;
 use DomainException;
 use DOMDocument;
@@ -46,16 +47,22 @@ class EditRejectedMdfeDocument
     public function formData(MdfeDocument $document): array
     {
         $snapshot = $document->snapshot;
+        $line = CiotLineEnum::tryFrom((string) ($snapshot['line'] ?? $document->ciot?->line?->value));
         $driverCpf = $snapshot['vehicle']['drivers'][0]['cpf'] ?? null;
 
         return [
-            'line' => $snapshot['line'] ?? $document->ciot?->line?->value,
+            'line' => $line?->value,
             'cte_document_ids' => $document->cteDocuments()->orderByPivot('position')->pluck('cte_documents.id')->all(),
             'ciot_mode' => 'existing',
             'ciot_id' => $document->ciot_id,
-            'driver_id' => MdfeDriver::query()->where('cpf', $driverCpf)->where('line', $snapshot['line'] ?? $document->ciot?->line?->value)->where('is_active', true)->value('id'),
+            'driver_id' => MdfeDriver::query()->where('cpf', $driverCpf)->where('line', $line?->operationalProfile()->value)->where('is_active', true)->value('id'),
             'endorsements' => array_map(fn (string $number): array => ['number' => $number], $snapshot['insurance']['endorsements'] ?? []),
             'route_ufs' => $snapshot['route_ufs'] ?? [],
+            'general_cargo' => $line === CiotLineEnum::GeneralCargo ? [
+                'type' => (string) ($snapshot['cargo']['type'] ?? ''),
+                'ncm' => (string) ($snapshot['cargo']['ncm'] ?? ''),
+                'weight_kg' => (string) ($snapshot['cargo']['weight_kg'] ?? ''),
+            ] : [],
             'homologation_fixture' => ($snapshot['insurance']['source'] ?? null) === 'homologation_fixture',
             'fixture_insurer_name' => $snapshot['insurance']['insurer_name'] ?? null,
             'fixture_insurer_cnpj' => $snapshot['insurance']['insurer_cnpj'] ?? null,
@@ -70,7 +77,7 @@ class EditRejectedMdfeDocument
         $this->assertConfirmedRejection($document);
         Validator::make($data, [
             'ciot_mode' => ['required', 'in:new'],
-            'line' => ['required', 'in:vehicle_removal,tank_alcohol'],
+            'line' => ['required', 'in:vehicle_removal,tank_alcohol,general_cargo'],
             'cte_document_ids' => ['required', 'array', 'min:1'],
             'cte_document_ids.*' => ['required', 'integer', 'distinct'],
             'new_ciot' => ['required', 'array'],
@@ -85,6 +92,25 @@ class EditRejectedMdfeDocument
             throw new DomainException('A seleção contém CT-es inexistentes ou duplicados.');
         }
         $documents = $selectedIds->map(fn (int $id): CteDocument => $documents->firstWhere('id', $id));
+        $line = CiotLineEnum::from($data['line']);
+        $documentLines = $documents
+            ->map(fn (CteDocument $cte): ?CiotLineEnum => CiotLineEnum::tryFrom((string) ($cte->snapshot['line'] ?? CiotLineEnum::VehicleRemoval->value)))
+            ->unique()
+            ->values();
+
+        if ($documentLines->count() !== 1 || $documentLines->first() !== $line
+            || ($line === CiotLineEnum::GeneralCargo && $documents->count() !== 1)) {
+            throw new DomainException('A modalidade informada deve corresponder aos CT-es selecionados.');
+        }
+
+        if ($line === CiotLineEnum::GeneralCargo) {
+            $data['new_ciot'] = app(ResolveGeneralCargoMdfeCargo::class)->prepareNewCiotData(
+                $documents->first(),
+                is_array($data['general_cargo'] ?? null) ? $data['general_cargo'] : null,
+                $data['new_ciot'],
+            );
+        }
+
         $ciotData = $data['new_ciot'];
         $ciotData['status'] = 'draft';
         $ciotData['line'] = $data['line'];
@@ -106,9 +132,13 @@ class EditRejectedMdfeDocument
             Validator::make($data, [
                 'ciot_mode' => ['required', 'in:existing'],
                 'ciot_id' => ['required', 'integer'],
-                'line' => ['required', 'in:vehicle_removal,tank_alcohol'],
+                'line' => ['required', 'in:vehicle_removal,tank_alcohol,general_cargo'],
                 'cte_document_ids' => ['required', 'array', 'min:1'],
                 'cte_document_ids.*' => ['required', 'integer', 'distinct'],
+                'general_cargo' => ['nullable', 'array'],
+                'general_cargo.type' => ['required_if:line,general_cargo', 'regex:/^(0[1-9]|1[0-2])$/'],
+                'general_cargo.ncm' => ['nullable', 'regex:/^(\d{2}|\d{8})$/'],
+                'general_cargo.weight_kg' => ['nullable', 'string'],
                 'endorsements' => ['required', 'array', 'min:1'],
                 'endorsements.*.number' => ['required', 'string', 'max:40'],
                 'route_ufs' => ['present', 'array'],
@@ -138,14 +168,29 @@ class EditRejectedMdfeDocument
             $sameSelection = (int) $locked->ciot_id === (int) $ciot->id
                 && $locked->cteDocuments()->orderByPivot('position')->pluck('cte_documents.id')->map(fn ($id): int => (int) $id)->all() === $selectedIds->all();
             $snapshotBuilder = app(BuildMdfeEmissionSnapshot::class);
-            $snapshot = $sameSelection ? $locked->snapshot : $snapshotBuilder->handleForDocuments(
-                documents: $documents, ciot: $ciot, endorsements: $endorsements,
-                routeUfs: $data['route_ufs'], batch: $locked->batch, driver: $driver,
-                homologationFixture: $fixture,
-                paymentMethod: $locked->snapshot['payment']['method'] ?? null,
-                paymentBankCode: $locked->snapshot['payment']['bank_code'] ?? null,
-                paymentBankAgency: $locked->snapshot['payment']['bank_agency'] ?? null,
-            );
+            $generalCargo = $line === CiotLineEnum::GeneralCargo ? (array) ($data['general_cargo'] ?? []) : null;
+            $rebuildSnapshot = ! $sameSelection || $line === CiotLineEnum::GeneralCargo;
+
+            if ($rebuildSnapshot) {
+                $rebuilt = $snapshotBuilder->handleForDocuments(
+                    documents: $documents, ciot: $ciot, endorsements: $endorsements,
+                    routeUfs: $data['route_ufs'], batch: $locked->batch, driver: $driver,
+                    homologationFixture: $fixture,
+                    paymentMethod: $locked->snapshot['payment']['method'] ?? null,
+                    paymentBankCode: $locked->snapshot['payment']['bank_code'] ?? null,
+                    paymentBankAgency: $locked->snapshot['payment']['bank_agency'] ?? null,
+                    generalCargo: $generalCargo,
+                );
+                $snapshot = $sameSelection ? $locked->snapshot : $rebuilt;
+
+                if ($sameSelection) {
+                    foreach (['cargo', 'payment'] as $section) {
+                        $snapshot[$section] = $rebuilt[$section];
+                    }
+                }
+            } else {
+                $snapshot = $locked->snapshot;
+            }
             if ($sameSelection) {
                 $snapshot['loading_cities'] = $snapshotBuilder->loadingCitiesFromCiotOrigin($ciot);
             }
@@ -200,7 +245,7 @@ class EditRejectedMdfeDocument
     {
         $driver = MdfeDriver::query()
             ->where('is_active', true)
-            ->where('line', $line->value)
+            ->where('line', $line->operationalProfile()->value)
             ->find($driverId);
 
         if ($driver === null) {

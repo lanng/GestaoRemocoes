@@ -32,6 +32,7 @@ class QueueDirectMdfeEmission
      * @param  array<int, string>  $endorsements
      * @param  array<int, string>  $routeUfs
      * @param  array{insurer_name: string, insurer_cnpj: string, policy_number: string}|null  $homologationFixture
+     * @param  array{type: string, ncm?: string|null, weight_kg?: string|null}|null  $generalCargo
      */
     public function handle(
         CteEmissionBatch $batch,
@@ -42,6 +43,7 @@ class QueueDirectMdfeEmission
         ?string $paymentMethod = null,
         ?string $paymentBankCode = null,
         ?string $paymentBankAgency = null,
+        ?array $generalCargo = null,
     ): MdfeDocument {
         $ciot = $batch->ciots()
             ->where('status', CiotStatusEnum::ISSUED->value)
@@ -64,6 +66,7 @@ class QueueDirectMdfeEmission
             paymentMethod: $paymentMethod,
             paymentBankCode: $paymentBankCode,
             paymentBankAgency: $paymentBankAgency,
+            generalCargo: $generalCargo,
         );
     }
 
@@ -72,6 +75,7 @@ class QueueDirectMdfeEmission
      * @param  array<int, string>  $endorsements
      * @param  array<int, string>  $routeUfs
      * @param  array{insurer_name: string, insurer_cnpj: string, policy_number: string}|null  $homologationFixture
+     * @param  array{type: string, ncm?: string|null, weight_kg?: string|null}|null  $generalCargo
      */
     public function handleForDocuments(
         Collection $documents,
@@ -84,6 +88,7 @@ class QueueDirectMdfeEmission
         ?string $paymentMethod = null,
         ?string $paymentBankCode = null,
         ?string $paymentBankAgency = null,
+        ?array $generalCargo = null,
     ): MdfeDocument {
         return DB::transaction(function () use (
             $documents,
@@ -96,6 +101,7 @@ class QueueDirectMdfeEmission
             $paymentMethod,
             $paymentBankCode,
             $paymentBankAgency,
+            $generalCargo,
         ): MdfeDocument {
             $documentIds = $documents->map(fn (CteDocument $document): int => (int) $document->id)->values();
 
@@ -150,6 +156,7 @@ class QueueDirectMdfeEmission
                 paymentMethod: $paymentMethod,
                 paymentBankCode: $paymentBankCode,
                 paymentBankAgency: $paymentBankAgency,
+                generalCargo: $generalCargo,
             );
             $this->snapshotValidator->assertLoadingCitiesMatchOrigin($snapshot);
             $mdfe = MdfeDocument::query()->create([

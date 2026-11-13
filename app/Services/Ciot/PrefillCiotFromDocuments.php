@@ -8,6 +8,7 @@ use App\Models\City;
 use App\Models\Company;
 use App\Models\CteDocument;
 use App\Models\CteEmissionBatch;
+use App\Services\Cte\ExactDecimal;
 use DomainException;
 use Illuminate\Support\Collection;
 
@@ -42,13 +43,17 @@ class PrefillCiotFromDocuments
 
         $line = $lines->first();
 
-        if ($line === CiotLineEnum::TankAlcohol && $documents->count() !== 1) {
-            throw new DomainException('A preparação de álcool aceita exatamente um CT-e.');
+        if (in_array($line, [CiotLineEnum::TankAlcohol, CiotLineEnum::GeneralCargo], true) && $documents->count() !== 1) {
+            throw new DomainException($line === CiotLineEnum::GeneralCargo
+                ? 'A preparação avulsa de carga geral aceita exatamente um CT-e.'
+                : 'A preparação de álcool aceita exatamente um CT-e.');
         }
 
-        return $line === CiotLineEnum::TankAlcohol
-            ? $this->prefillTankAlcohol($documents->first())
-            : $this->prefillVehicleRemoval($documents);
+        return match ($line) {
+            CiotLineEnum::TankAlcohol => $this->prefillTankAlcohol($documents->first()),
+            CiotLineEnum::GeneralCargo => $this->prefillGeneralCargo($documents->first()),
+            CiotLineEnum::VehicleRemoval => $this->prefillVehicleRemoval($documents),
+        };
     }
 
     /**
@@ -59,7 +64,7 @@ class PrefillCiotFromDocuments
         return CiotVehicle::query()
             ->where('is_active', true)
             ->where(fn ($query) => $query
-                ->where('line', $line->value)
+                ->where('line', $line->operationalProfile()->value)
                 ->orWhereNull('line'))
             ->orderBy('type')
             ->orderBy('plate')
@@ -216,6 +221,116 @@ class PrefillCiotFromDocuments
             'ranking' => $distance === null ? '' : sprintf('%s → %s: %d km', $originCity->name, $destinationCity->name, $distance),
             'warnings' => $warnings,
             'origins' => $origins,
+            'patios' => collect([$payer, $delivery])->filter()->unique('id')->values(),
+        ];
+    }
+
+    /** @return array{form: array<string, mixed>, ranking: string, warnings: list<string>, origins: Collection, patios: Collection} */
+    private function prefillGeneralCargo(CteDocument $document): array
+    {
+        $snapshot = (array) $document->snapshot;
+        $warnings = [];
+        $origin = $this->place($document, 'origin');
+        $destination = $this->place($document, 'destination');
+        $cities = City::query()->orderBy('name')->get();
+        $originCity = $this->resolveCityForPlace($origin, $warnings, 'origem', $cities);
+        $destinationCity = $this->resolveCityForPlace($destination, $warnings, 'destino', $cities);
+        $distance = $originCity !== null && $destinationCity !== null
+            ? app(CityDistanceCalculator::class)->calculate($originCity, $destinationCity)
+            : null;
+
+        if ($distance === null) {
+            $warnings[] = 'Não foi possível calcular a rota entre os municípios do CT-e — informe a distância manualmente.';
+        }
+
+        $payerPartyKey = match ((string) ($snapshot['taker_code'] ?? '')) {
+            '0' => 'rem',
+            '3' => 'dest',
+            '4' => 'taker',
+            default => null,
+        };
+        $payerParty = $payerPartyKey === null ? [] : (array) ($snapshot[$payerPartyKey] ?? []);
+        $payerCnpj = preg_replace('/\D/', '', (string) ($payerParty['cnpj'] ?? '')) ?: '';
+        $payer = $this->companyByCnpj($payerCnpj);
+
+        if ($payer === null) {
+            $warnings[] = 'O tomador do CT-e não corresponde a uma empresa ativa com CNPJ cadastrado — selecione o contratante manualmente.';
+        }
+
+        $deliveryParty = (array) ($snapshot['dest'] ?? []);
+        $deliveryCnpj = preg_replace('/\D/', '', (string) ($deliveryParty['cnpj'] ?? '')) ?: '';
+        $delivery = $this->companyByCnpj($deliveryCnpj);
+
+        if ($delivery === null) {
+            $warnings[] = 'O destinatário do CT-e não corresponde a uma empresa ativa com CNPJ cadastrado — selecione o destinatário da entrega manualmente.';
+        }
+
+        $weight = data_get($snapshot, 'cargo.weight_kg');
+
+        if (blank($weight)) {
+            $weight = $snapshot['cargo_weight_kg'] ?? null;
+        }
+
+        $cargoWeight = '';
+
+        if (filled($weight)) {
+            try {
+                $weightCentiKg = ExactDecimal::parse((string) $weight, 2, 'CT-e avulso', 'peso da carga');
+            } catch (DomainException $exception) {
+                throw new DomainException('O CT-e avulso deve informar o peso real da carga com até duas casas decimais.', previous: $exception);
+            }
+
+            if ($weightCentiKg > 0) {
+                $cargoWeight = ExactDecimal::format($weightCentiKg, 2);
+            }
+        }
+
+        if ($cargoWeight === '') {
+            $warnings[] = 'O CT-e não informa o peso real da carga — complete o peso manualmente antes de emitir o CIOT.';
+        }
+
+        $freightValue = $this->decimalString(
+            filled(data_get($snapshot, 'freight.total')) ? data_get($snapshot, 'freight.total') : ($snapshot['value'] ?? null),
+            2,
+        );
+
+        if ($freightValue === '' || $this->decimalToCents($freightValue) <= 0) {
+            $warnings[] = 'O CT-e não informa um frete positivo — complete o valor antes de emitir o CIOT.';
+        }
+
+        $form = [
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'operation_type' => 'lotation',
+            'payer_id' => $payer?->id,
+            'payer_cnpj' => $payerCnpj,
+            'payer_name' => (string) ($payerParty['xNome'] ?? $payerParty['name'] ?? ''),
+            'delivery_payer_id' => $delivery?->id,
+            'delivery_payer_cnpj' => $deliveryCnpj,
+            'delivery_payer_name' => (string) ($deliveryParty['xNome'] ?? $deliveryParty['name'] ?? ''),
+            'additional_payers' => [],
+            'origin.ibge' => $origin['ibge'] ?: null,
+            'origin.cidade' => $origin['name'],
+            'origin.uf' => $origin['uf'],
+            'origin.cep' => $origin['cep'] ?: null,
+            'destination' => [
+                'cidade' => $destination['name'],
+                'uf' => $destination['uf'],
+                'cep' => $destination['cep'] ?: null,
+                'ibge' => $destination['ibge'] ?: null,
+            ],
+            'distance_km' => $distance,
+            'freight_value' => $freightValue,
+            'cargo_weight_kg' => $cargoWeight,
+            'vehicle_ids' => [],
+            'travel_start_at' => today(),
+            'travel_end_at' => $this->dateValue($snapshot['dprev'] ?? null) ?? today()->addDay(),
+        ];
+
+        return [
+            'form' => $form,
+            'ranking' => $distance === null ? '' : sprintf('%s → %s: %d km', $origin['name'], $destination['name'], $distance),
+            'warnings' => $warnings,
+            'origins' => collect($originCity === null ? [] : [$originCity]),
             'patios' => collect([$payer, $delivery])->filter()->unique('id')->values(),
         ];
     }

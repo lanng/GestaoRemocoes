@@ -2,6 +2,7 @@
 
 namespace Tests\Feature\Filament;
 
+use App\Enums\CiotLineEnum;
 use App\Enums\CiotStatusEnum;
 use App\Filament\Resources\CiotResource;
 use App\Filament\Resources\CiotResource\Pages\CreateCiot;
@@ -195,6 +196,85 @@ class CiotResourceTest extends TestCase
             ->assertHasFormErrors(['freight_value']);
 
         $this->assertDatabaseEmpty(Ciot::class);
+    }
+
+    public function test_general_cargo_create_validates_freight_and_weight_precision_before_transforming(): void
+    {
+        Http::fake();
+        $payer = Company::factory()->create();
+        $tractor = CiotVehicle::factory()->create(['plate' => 'PUC8E55', 'type' => 'automotor', 'axles' => 3]);
+
+        $component = Livewire::test(CreateCiot::class)
+            ->fillForm($this->generalCargoFormData($payer, $tractor, [
+                'freight_value' => '500,001',
+                'cargo_weight_kg' => '1234,567',
+            ]))
+            ->assertSet('data.line', CiotLineEnum::GeneralCargo->value)
+            ->assertSet('data.freight_value', '500,001')
+            ->assertSet('data.cargo_weight_kg', '1234,567')
+            ->call('create');
+
+        $component->assertHasFormErrors(['freight_value', 'cargo_weight_kg']);
+        $this->assertDatabaseEmpty(Ciot::class);
+        Http::assertNotSent(fn ($request): bool => str_starts_with($request->url(), rtrim(config('ciot.base_url'), '/')));
+    }
+
+    public function test_general_cargo_create_requires_a_positive_weight(): void
+    {
+        Http::fake();
+        $payer = Company::factory()->create();
+        $tractor = CiotVehicle::factory()->create(['plate' => 'PUC8E55', 'type' => 'automotor', 'axles' => 3]);
+
+        foreach ([null, '0,00'] as $weight) {
+            Livewire::test(CreateCiot::class)
+                ->fillForm($this->generalCargoFormData($payer, $tractor, ['cargo_weight_kg' => $weight]))
+                ->call('create')
+                ->assertHasFormErrors(['cargo_weight_kg']);
+        }
+
+        $this->assertDatabaseEmpty(Ciot::class);
+        Http::assertNotSent(fn ($request): bool => str_starts_with($request->url(), rtrim(config('ciot.base_url'), '/')));
+    }
+
+    public function test_general_cargo_edit_validates_freight_and_weight_precision_without_mutating_the_ciot(): void
+    {
+        Http::fake();
+        $ciot = Ciot::factory()->create([
+            'line' => CiotLineEnum::GeneralCargo,
+            'freight_value_cents' => 50000,
+            'cargo_weight_kg' => '1234.56',
+        ]);
+
+        Livewire::test(EditCiot::class, ['record' => $ciot->id])
+            ->fillForm([
+                'freight_value' => '500,001',
+                'cargo_weight_kg' => '1234,567',
+            ])
+            ->call('save')
+            ->assertHasFormErrors(['freight_value', 'cargo_weight_kg']);
+
+        $this->assertSame(50000, $ciot->fresh()->freight_value_cents);
+        $this->assertSame('1234.56', (string) $ciot->fresh()->cargo_weight_kg);
+        Http::assertNotSent(fn ($request): bool => str_starts_with($request->url(), rtrim(config('ciot.base_url'), '/')));
+    }
+
+    public function test_general_cargo_create_accepts_trailing_zero_padding_and_saves_exact_two_decimal_values(): void
+    {
+        $payer = Company::factory()->create();
+        $tractor = CiotVehicle::factory()->create(['plate' => 'PUC8E55', 'type' => 'automotor', 'axles' => 3]);
+
+        Livewire::test(CreateCiot::class)
+            ->fillForm($this->generalCargoFormData($payer, $tractor, [
+                'freight_value' => '500.0000',
+                'cargo_weight_kg' => '1234.5600',
+            ]))
+            ->call('create')
+            ->assertHasNoFormErrors();
+
+        $ciot = Ciot::query()->firstOrFail();
+
+        $this->assertSame(50000, $ciot->freight_value_cents);
+        $this->assertSame('1234.56', (string) $ciot->cargo_weight_kg);
     }
 
     public function test_the_emit_action_enqueues_the_emission(): void
@@ -688,6 +768,31 @@ class CiotResourceTest extends TestCase
         Ciot::factory()->create();
 
         $this->assertSame('2', CiotResource::getNavigationBadge());
+    }
+
+    /** @param array<string, mixed> $overrides @return array<string, mixed> */
+    private function generalCargoFormData(Company $payer, CiotVehicle $tractor, array $overrides = []): array
+    {
+        return array_replace([
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'operation_type' => 'lotation',
+            'payer_id' => $payer->id,
+            'delivery_payer_id' => $payer->id,
+            'origin.cidade' => 'Osvaldo Cruz',
+            'origin.uf' => 'SP',
+            'origin.cep' => '17700000',
+            'origin.ibge' => '3534609',
+            'destination.cidade' => 'Caçapava',
+            'destination.uf' => 'SP',
+            'destination.cep' => '12286140',
+            'destination.ibge' => '3508504',
+            'distance_km' => '716',
+            'freight_value' => '500.00',
+            'cargo_weight_kg' => '1234.56',
+            'vehicle_ids' => [$tractor->id],
+            'travel_start_at' => now()->addDay()->format('Y-m-d'),
+            'travel_end_at' => now()->addDays(2)->format('Y-m-d'),
+        ], $overrides);
     }
 
     /**

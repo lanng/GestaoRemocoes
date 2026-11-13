@@ -128,6 +128,34 @@ class BuildCiotDeclarationPayloadTest extends TestCase
         $this->assertSame('222', $payload['InfPagamento'][0]['NumeroConta']);
     }
 
+    public function test_general_cargo_uses_the_removal_operational_profile_without_changing_its_ciots_line(): void
+    {
+        $line = CiotLineEnum::GeneralCargo;
+        $ciot = Ciot::factory()->create([
+            'line' => $line,
+            'operation_type' => CiotOperationTypeEnum::Lotation,
+            'payer_cnpj' => '14517191000925',
+            'vehicles' => [
+                ['placa' => 'PUC8E55', 'rntrc' => '045963122', 'eixos' => 3, 'tipo' => 'automotor'],
+            ],
+            'distance_km' => '716.00',
+            'freight_value_cents' => 100000,
+            'cargo_weight_kg' => '1234.56',
+            'travel_start_at' => now()->addDay(),
+            'travel_end_at' => now()->addDays(2),
+        ]);
+
+        $payload = app(BuildCiotDeclarationPayload::class)->handle($ciot);
+
+        $this->assertSame(CiotLineEnum::VehicleRemoval, $line->operationalProfile());
+        $this->assertSame('vehicle_removal', $line->configKey());
+        $this->assertSame(1, $payload['DadosCarga']['CodigoNaturezaCarga']);
+        $this->assertSame(5, $payload['DadosCarga']['CodigoTipoCarga']);
+        $this->assertSame(1234.56, $payload['DadosCarga']['PesoCarga']);
+        $this->assertSame('0001', $payload['InfPagamento'][0]['NumeroAgencia']);
+        $this->assertSame(CiotLineEnum::GeneralCargo, $ciot->fresh()->line);
+    }
+
     public function test_natureza_fallback_preserves_the_line_cargo_type(): void
     {
         config(['ciot.natureza_fallback' => true]);

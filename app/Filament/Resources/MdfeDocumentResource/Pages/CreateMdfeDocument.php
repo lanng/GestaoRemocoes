@@ -15,6 +15,8 @@ use App\Models\CteEmissionBatch;
 use App\Models\MdfeDriver;
 use App\Services\Ciot\PrefillCiotFromDocuments;
 use App\Services\Ciot\PrepareMdfeDocument;
+use App\Support\PtbrNumeric;
+use App\Support\PtbrNumericRule;
 use DomainException;
 use Filament\Forms\Components\Placeholder;
 use Filament\Forms\Components\Repeater;
@@ -101,6 +103,7 @@ class CreateMdfeDocument extends Page implements HasForms
                             ->afterStateUpdated(function (Set $set, ?string $state): void {
                                 $set('cte_document_ids', []);
                                 $set('ciot_id', null);
+                                $set('general_cargo', []);
                                 $line = CiotLineEnum::tryFrom((string) $state);
                                 $set('driver_id', $line === null ? null : $this->defaultDriverId($line));
                                 $set('new_ciot', $line === null ? [] : $this->defaultNewCiotData($line));
@@ -111,6 +114,10 @@ class CreateMdfeDocument extends Page implements HasForms
                             ->label('CT-es do MDF-e')
                             ->placeholder('Pesquise por número, série ou chave')
                             ->multiple()
+                            ->maxItems(fn (Get $get): ?int => in_array($get('line'), [
+                                CiotLineEnum::TankAlcohol->value,
+                                CiotLineEnum::GeneralCargo->value,
+                            ], true) ? 1 : null)
                             ->searchable()
                             ->preload()
                             ->required()
@@ -161,7 +168,10 @@ class CreateMdfeDocument extends Page implements HasForms
                             ->visible(fn (Get $get): bool => $get('ciot_mode') === 'new' && $get('line') !== null)
                             ->columnSpanFull(),
                         \Filament\Forms\Components\Group::make()
-                            ->schema(CiotResource::formSchema(lineReadOnly: true))
+                            ->schema(CiotResource::formSchema(
+                                lineReadOnly: true,
+                                allowGeneralCargoWeightFallback: true,
+                            ))
                             ->statePath('new_ciot')
                             ->visible(fn (Get $get): bool => $get('ciot_mode') === 'new' && $get('line') !== null)
                             ->columnSpanFull(),
@@ -169,6 +179,30 @@ class CreateMdfeDocument extends Page implements HasForms
                 Section::make('Dados do MDF-e')
                     ->columns(2)
                     ->schema([
+                        Select::make('general_cargo.type')
+                            ->label('Tipo da carga predominante')
+                            ->placeholder('Selecione o tipo conforme a classificação fiscal')
+                            ->options(self::generalCargoTypeOptions())
+                            ->required(fn (Get $get): bool => $get('line') === CiotLineEnum::GeneralCargo->value)
+                            ->visible(fn (Get $get): bool => $get('line') === CiotLineEnum::GeneralCargo->value),
+                        TextInput::make('general_cargo.ncm')
+                            ->label('NCM do produto predominante (opcional)')
+                            ->maxLength(8)
+                            ->helperText('Informe 2 ou 8 dígitos, se disponível no CT-e.')
+                            ->visible(fn (Get $get): bool => $get('line') === CiotLineEnum::GeneralCargo->value),
+                        TextInput::make('general_cargo.weight_kg')
+                            ->label('Peso real manual para o novo CIOT (kg)')
+                            ->helperText('Use somente se necessário; deve corresponder ao CT-e e será gravado no novo CIOT. Um CIOT emitido não pode ser alterado.')
+                            ->inputMode('decimal')
+                            ->formatStateUsing(fn ($state): ?string => PtbrNumeric::format($state))
+                            ->rule(new PtbrNumericRule(min: 0.01))
+                            ->rules(fn (Get $get): array => $get('line') === CiotLineEnum::GeneralCargo->value
+                                && $get('ciot_mode') === 'new'
+                                ? [CiotResource::exactGeneralCargoDecimalRule('peso manual', mustBePositive: true)]
+                                : [])
+                            ->dehydrateStateUsing(fn ($state): ?string => PtbrNumeric::normalize($state))
+                            ->visible(fn (Get $get): bool => $get('line') === CiotLineEnum::GeneralCargo->value
+                                && $get('ciot_mode') === 'new'),
                         Repeater::make('endorsements')
                             ->label('Averbações desta operação')
                             ->helperText(filled(config('dfe.mdfe.default_endorsement'))
@@ -186,7 +220,7 @@ class CreateMdfeDocument extends Page implements HasForms
                         Select::make('driver_id')
                             ->label('Motorista do MDF-e')
                             ->options(fn (Get $get): array => MdfeDriver::query()
-                                ->where('line', $get('line'))
+                                ->where('line', CiotLineEnum::tryFrom((string) $get('line'))?->operationalProfile()->value)
                                 ->where('is_active', true)
                                 ->orderBy('name')
                                 ->pluck('name', 'id')
@@ -292,6 +326,25 @@ class CreateMdfeDocument extends Page implements HasForms
         return collect(CiotLineEnum::cases())
             ->mapWithKeys(fn (CiotLineEnum $line): array => [$line->value => $line->label()])
             ->all();
+    }
+
+    /** @return array<string, string> */
+    private static function generalCargoTypeOptions(): array
+    {
+        return [
+            '01' => 'Granel sólido',
+            '02' => 'Granel líquido',
+            '03' => 'Frigorificada',
+            '04' => 'Conteinerizada',
+            '05' => 'Carga geral',
+            '06' => 'Neogranel',
+            '07' => 'Perigosa (granel sólido)',
+            '08' => 'Perigosa (granel líquido)',
+            '09' => 'Perigosa (carga frigorificada)',
+            '10' => 'Perigosa (conteinerizada)',
+            '11' => 'Perigosa (carga geral)',
+            '12' => 'Granel pressurizada',
+        ];
     }
 
     /** @return array<string, string> */
@@ -415,7 +468,8 @@ class CreateMdfeDocument extends Page implements HasForms
             $batch->id,
         );
 
-        if ($documents->isEmpty() || ($line === CiotLineEnum::TankAlcohol && $documents->count() !== 1)) {
+        if ($documents->isEmpty()
+            || (in_array($line, [CiotLineEnum::TankAlcohol, CiotLineEnum::GeneralCargo], true) && $documents->count() !== 1)) {
             return [];
         }
 
@@ -445,13 +499,14 @@ class CreateMdfeDocument extends Page implements HasForms
 
     private function defaultDriverId(CiotLineEnum $line): ?int
     {
+        $operationalProfile = $line->operationalProfile();
         $drivers = MdfeDriver::query()
-            ->where('line', $line->value)
+            ->where('line', $operationalProfile->value)
             ->where('is_active', true)
             ->orderBy('name')
             ->get(['id', 'is_default']);
 
-        if ($line === CiotLineEnum::VehicleRemoval) {
+        if ($operationalProfile === CiotLineEnum::VehicleRemoval) {
             return $drivers->firstWhere('is_default', true)?->id;
         }
 
@@ -467,6 +522,7 @@ class CreateMdfeDocument extends Page implements HasForms
         $this->prefillWarnings = [];
         $this->routeRanking = '';
         $set('ciot_id', null);
+        $set('general_cargo', ['type' => null, 'ncm' => null, 'weight_kg' => null]);
 
         if ($line === null || $selectedIds === []) {
             $set('new_ciot', $line === null

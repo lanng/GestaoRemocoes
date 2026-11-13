@@ -2,6 +2,7 @@
 
 namespace Tests\Feature\Filament;
 
+use App\Enums\CiotLineEnum;
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteDocumentStatusEnum;
 use App\Enums\FiscalDocumentStatusEnum;
@@ -11,6 +12,7 @@ use App\Filament\Resources\MdfeDocumentResource\Pages\ManageMdfeDocuments;
 use App\Filament\Resources\MdfeDocumentResource\Pages\ViewMdfeDocument;
 use App\Models\Ciot;
 use App\Models\CiotVehicle;
+use App\Models\Company;
 use App\Models\CteDocument;
 use App\Models\CteEmissionBatch;
 use App\Models\DfeDocumentReservation;
@@ -22,6 +24,7 @@ use Filament\Facades\Filament;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 use Livewire\Livewire;
 use Tests\TestCase;
@@ -216,6 +219,209 @@ class MdfeDocumentResourceTest extends TestCase
             ->assertFormFieldExists('driver_id', fn ($field): bool => isset($field->getOptions()[$driver->id]))
             ->call('prepare')
             ->assertHasFormErrors(['driver_id' => 'required']);
+    }
+
+    public function test_general_cargo_form_uses_removal_driver_profile_and_exposes_explicit_mdfe_cargo_fields(): void
+    {
+        $fixedRemovalDriver = MdfeDriver::factory()->create(['line' => 'vehicle_removal', 'is_default' => true]);
+        $otherRemovalDriver = MdfeDriver::factory()->create(['line' => 'vehicle_removal']);
+        MdfeDriver::factory()->create(['line' => 'tank_alcohol']);
+        $removalCiot = Ciot::factory()->issued()->create(['line' => 'vehicle_removal']);
+        $generalCargoCiot = Ciot::factory()->issued()->create(['line' => 'general_cargo']);
+        $tankCiot = Ciot::factory()->issued()->tankAlcohol()->create();
+
+        Livewire::test(CreateMdfeDocument::class)
+            ->set('data.line', 'general_cargo')
+            ->set('data.ciot_mode', 'existing')
+            ->assertSet('data.driver_id', $fixedRemovalDriver->id)
+            ->assertFormFieldIsVisible('general_cargo.type')
+            ->assertFormFieldIsVisible('general_cargo.ncm')
+            ->assertFormFieldIsHidden('general_cargo.weight_kg')
+            ->assertFormFieldExists('general_cargo.type', fn ($field): bool => $field->isRequired()
+                && array_map('strval', array_keys($field->getOptions())) === [
+                    '01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12',
+                ])
+            ->assertFormFieldExists('driver_id', fn ($field): bool => array_keys($field->getOptions()) === collect([
+                $fixedRemovalDriver,
+                $otherRemovalDriver,
+            ])->sortBy('name')->pluck('id')->all())
+            ->assertFormFieldExists('cte_document_ids', fn ($field): bool => $field->getMaxItems() === 1)
+            ->assertFormFieldExists('ciot_id', function ($field) use ($generalCargoCiot, $removalCiot, $tankCiot): bool {
+                $optionIds = array_map('intval', array_keys($field->getOptions()));
+                sort($optionIds);
+                $expectedIds = [$removalCiot->id, $generalCargoCiot->id];
+                sort($expectedIds);
+
+                return $optionIds === $expectedIds && ! array_key_exists($tankCiot->id, $field->getOptions());
+            });
+
+        Livewire::test(CreateMdfeDocument::class)
+            ->set('data.line', 'general_cargo')
+            ->set('data.ciot_mode', 'new')
+            ->assertFormFieldIsVisible('general_cargo.weight_kg')
+            ->assertFormFieldExists('general_cargo.weight_kg', fn ($field): bool => $field->getLabel() === 'Peso real manual para o novo CIOT (kg)');
+    }
+
+    public function test_changing_or_clearing_cte_selection_clears_general_cargo_classification_fields(): void
+    {
+        $first = $this->generalCargoCte('35261012563112000130570010000000011000000001');
+        $second = $this->generalCargoCte('35261012563112000130570010000000021000000002');
+
+        $page = Livewire::test(CreateMdfeDocument::class)
+            ->set('data.line', 'general_cargo')
+            ->set('data.cte_document_ids', [$first->id])
+            ->set('data.general_cargo.type', '05')
+            ->set('data.general_cargo.ncm', '84295100')
+            ->set('data.general_cargo.weight_kg', '100.20')
+            ->set('data.cte_document_ids', [$second->id]);
+
+        $this->assertNull($page->get('data.general_cargo.type'));
+        $this->assertNull($page->get('data.general_cargo.ncm'));
+        $this->assertNull($page->get('data.general_cargo.weight_kg'));
+
+        $page->set('data.general_cargo.type', '11')
+            ->set('data.general_cargo.ncm', '87089997')
+            ->set('data.general_cargo.weight_kg', '200.30')
+            ->set('data.cte_document_ids', []);
+
+        $this->assertNull($page->get('data.general_cargo.type'));
+        $this->assertNull($page->get('data.general_cargo.ncm'));
+        $this->assertNull($page->get('data.general_cargo.weight_kg'));
+
+        $page->set('data.general_cargo.type', '04')
+            ->set('data.general_cargo.ncm', '12345678')
+            ->set('data.general_cargo.weight_kg', '300.40')
+            ->set('data.cte_document_ids', [999999]);
+
+        $this->assertNull($page->get('data.general_cargo.type'));
+        $this->assertNull($page->get('data.general_cargo.ncm'));
+        $this->assertNull($page->get('data.general_cargo.weight_kg'));
+    }
+
+    public function test_new_general_cargo_manual_weight_precision_is_a_field_validation_error(): void
+    {
+        Http::fake();
+        $document = $this->generalCargoCte('35261012563112000130570010000000041000000004');
+        $driver = MdfeDriver::factory()->create(['line' => CiotLineEnum::VehicleRemoval->value]);
+        $payer = Company::factory()->create(['cnpj' => '14517191000925']);
+        $tractor = CiotVehicle::factory()->forRemoval()->create(['plate' => 'PUC8E55']);
+        $newCiot = [
+            'status' => 'draft',
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'operation_type' => 'lotation',
+            'payer_id' => $payer->id,
+            'delivery_payer_id' => $payer->id,
+            'origin' => ['cidade' => 'Osvaldo Cruz', 'uf' => 'SP', 'cep' => '17700000', 'ibge' => '3534609'],
+            'destination' => ['cidade' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140', 'ibge' => '3508504'],
+            'distance_km' => '716',
+            'freight_value' => '500.00',
+            'cargo_weight_kg' => null,
+            'vehicle_ids' => [$tractor->id],
+            'travel_start_at' => today()->toDateString(),
+            'travel_end_at' => today()->addDay()->toDateString(),
+        ];
+
+        Livewire::test(CreateMdfeDocument::class)
+            ->set('data.line', CiotLineEnum::GeneralCargo->value)
+            ->set('data.driver_id', $driver->id)
+            ->set('data.cte_document_ids', [$document->id])
+            ->set('data.ciot_mode', 'new')
+            ->set('data.new_ciot', $newCiot)
+            ->set('data.general_cargo.type', '05')
+            ->set('data.general_cargo.weight_kg', '100,201')
+            ->set('data.endorsements', [['number' => 'AVER-GERAL-PRECISION']])
+            ->call('prepare')
+            ->assertHasFormErrors(['general_cargo.weight_kg']);
+
+        $this->assertDatabaseCount('ciots', 0);
+        $this->assertDatabaseCount('mdfe_documents', 0);
+        Http::assertNotSent(fn ($request): bool => str_starts_with($request->url(), rtrim(config('ciot.base_url'), '/')));
+    }
+
+    public function test_new_general_cargo_livewire_flow_uses_manual_weight_for_the_issued_ciot_and_mdfe(): void
+    {
+        config([
+            'ciot.api_key' => 'test-api-key',
+            'ciot.base_url' => 'https://antt-hml.test/pefServices',
+            'ciot.company.cnpj' => '12563112000130',
+            'ciot.company.rntrc' => '45963122',
+            'ciot.lines.vehicle_removal.bank_code' => '756',
+            'ciot.lines.vehicle_removal.bank_agency' => '0001',
+            'dfe.tp_amb' => '2',
+            'dfe.emit.cnpj' => '12563112000130',
+            'dfe.mdfe.rntrc' => '45963122',
+            'dfe.mdfe.insurer_name' => 'Seguradora Fixture',
+            'dfe.mdfe.insurer_cnpj' => '11111111111111',
+            'dfe.mdfe.policy_number' => 'APOLICE-HML',
+            'dfe.mdfe.tp_emit' => '1',
+        ]);
+        Queue::fake();
+        $document = $this->generalCargoCte('35261012563112000130570010000000031000000003');
+        $cteSnapshot = $document->snapshot;
+        $cteSnapshot['cargo']['weight_kg'] = null;
+        $cteSnapshot['cargo_weight_kg'] = null;
+        $document->forceFill(['snapshot' => $cteSnapshot])->save();
+        $driver = MdfeDriver::factory()->create(['line' => CiotLineEnum::VehicleRemoval->value]);
+        $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
+        $tractor = CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55',
+            'renavam' => '12345678901',
+            'tare_kg' => 8000,
+            'capacity_kg' => 12000,
+            'type_rod' => '03',
+            'body_type' => '00',
+            'uf' => 'SP',
+        ]);
+        Http::fake([
+            'https://antt-hml.test/pefServices/gerar' => Http::response([
+                'Sucesso' => true,
+                'Dados' => ['CIOT' => '520032959996'],
+            ], 200),
+            'https://antt-hml.test/pefServices/api/DeclaracaoOperacaoTransporte' => Http::response([
+                'Codigo' => '110',
+                'Mensagem' => 'Dados cadastrados com sucesso',
+                'Protocolo' => '5200329599960001',
+                'CodigoVerificador' => '0001',
+                'IdOperacaoTransporte' => '520032959996',
+            ], 200),
+        ]);
+        $newCiot = [
+            'status' => 'draft',
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'operation_type' => 'lotation',
+            'payer_id' => $payer->id,
+            'delivery_payer_id' => $payer->id,
+            'origin' => ['cidade' => 'Osvaldo Cruz', 'uf' => 'SP', 'cep' => '17700000', 'ibge' => '3534609'],
+            'destination' => ['cidade' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140', 'ibge' => '3508504'],
+            'distance_km' => '716',
+            'freight_value' => '500.00',
+            'cargo_weight_kg' => null,
+            'vehicle_ids' => [$tractor->id],
+            'travel_start_at' => today()->toDateString(),
+            'travel_end_at' => today()->addDay()->toDateString(),
+        ];
+
+        $page = Livewire::test(CreateMdfeDocument::class)
+            ->set('data.line', CiotLineEnum::GeneralCargo->value)
+            ->set('data.driver_id', $driver->id)
+            ->set('data.cte_document_ids', [$document->id])
+            ->set('data.ciot_mode', 'new')
+            ->set('data.new_ciot', $newCiot)
+            ->set('data.general_cargo.type', '05')
+            ->set('data.general_cargo.ncm', null)
+            ->set('data.general_cargo.weight_kg', '100.20')
+            ->set('data.endorsements', [['number' => 'AVER-GERAL-LIVEWIRE']])
+            ->call('prepare')
+            ->assertHasNoFormErrors()
+            ->assertRedirect();
+
+        $ciot = Ciot::query()->firstOrFail();
+        $mdfe = MdfeDocument::query()->firstOrFail();
+
+        $this->assertSame(CiotStatusEnum::ISSUED, $ciot->status);
+        $this->assertSame('100.20', (string) $ciot->cargo_weight_kg);
+        $this->assertSame('100.2000', $mdfe->snapshot['cargo']['weight_kg']);
+        $this->assertSame($ciot->id, $mdfe->ciot_id);
     }
 
     public function test_removal_batch_preparation_suggests_its_fixed_driver(): void
@@ -772,5 +978,31 @@ class MdfeDocumentResourceTest extends TestCase
 
         Livewire::test(ViewMdfeDocument::class, ['record' => $document->getRouteKey()])
             ->assertActionHidden('cancelMdfe');
+    }
+
+    private function generalCargoCte(string $accessKey): CteDocument
+    {
+        return CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => null,
+            'register_id' => null,
+            'workflow_origin' => 'controlled_v1',
+            'access_key' => $accessKey,
+            'snapshot' => [
+                'schema_version' => 5,
+                'line' => 'general_cargo',
+                'origin_document_mode' => 'other',
+                'other_document' => ['type' => 'carta_remocao', 'tp_doc' => '99', 'description' => 'CARTA DE REMOCAO'],
+                'nfe_documents' => [],
+                'value' => '500.00',
+                'cargo' => [
+                    'value' => '25000.00',
+                    'predominant_product' => 'PA CARREGADEIRA',
+                    'weight_kg' => '100.20',
+                ],
+                'cargo_weight_kg' => '100.20',
+                'origin' => ['ibge' => '3534609', 'name' => 'Osvaldo Cruz', 'uf' => 'SP', 'cep' => '17700000'],
+                'destination' => ['ibge' => '3508504', 'name' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140'],
+            ],
+        ]);
     }
 }

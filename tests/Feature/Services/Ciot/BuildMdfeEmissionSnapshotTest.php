@@ -243,6 +243,184 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
         $this->assertSame('87033210', $productionSnapshot['cargo']['ncm']);
     }
 
+    public function test_builds_general_cargo_snapshot_from_cte_cargo_and_removal_profile_with_explicit_classification(): void
+    {
+        $ciot = Ciot::factory()->issued()->create([
+            'line' => CiotLineEnum::VehicleRemoval,
+            'vehicles' => [['placa' => 'PUC8E55', 'tipo' => 'automotor']],
+            'cargo_weight_kg' => '1234.56',
+            'freight_value_cents' => 75000,
+        ]);
+        $document = CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => null,
+            'register_id' => null,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => [
+                'schema_version' => 5,
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'origin_document_mode' => 'other',
+                'other_document' => [
+                    'type' => 'carta_remocao',
+                    'tp_doc' => '99',
+                    'description' => 'CARTA DE REMOCAO',
+                ],
+                'nfe_documents' => [],
+                'value' => '750.00',
+                'cargo' => [
+                    'value' => '25000.00',
+                    'predominant_product' => 'PA CARREGADEIRA',
+                    'weight_kg' => '1234.56',
+                ],
+                'origin' => ['ibge' => '3534609', 'name' => 'Osvaldo Cruz', 'uf' => 'SP', 'cep' => '17700000'],
+                'destination' => ['ibge' => '3508504', 'name' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140'],
+            ],
+        ]);
+        CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55', 'renavam' => '12345678901', 'tare_kg' => 8000,
+            'capacity_kg' => 12000, 'type_rod' => '03', 'body_type' => '00', 'uf' => 'SP',
+        ]);
+        $driver = MdfeDriver::factory()->create(['line' => CiotLineEnum::VehicleRemoval->value]);
+
+        $snapshot = app(BuildMdfeEmissionSnapshot::class)->handleForDocuments(
+            documents: collect([$document]),
+            ciot: $ciot,
+            endorsements: ['AVERBACAO-GERAL-001'],
+            routeUfs: [],
+            driver: $driver,
+            generalCargo: ['weight_kg' => '1234.56', 'type' => '05', 'ncm' => '84295100'],
+        );
+
+        $this->assertSame(CiotLineEnum::GeneralCargo->value, $snapshot['line']);
+        $this->assertSame('PA CARREGADEIRA', $snapshot['cargo']['predominant_product']);
+        $this->assertSame('25000.00', $snapshot['cargo']['value']);
+        $this->assertSame('1234.5600', $snapshot['cargo']['weight_kg']);
+        $this->assertSame('05', $snapshot['cargo']['type']);
+        $this->assertSame('84295100', $snapshot['cargo']['ncm']);
+        $this->assertSame($driver->cpf, $snapshot['vehicle']['drivers'][0]['cpf']);
+        $this->assertArrayNotHasKey('fipe_value', $snapshot['cargo']);
+    }
+
+    public function test_general_cargo_weight_rejects_conflicting_cte_and_ciot_values(): void
+    {
+        [$document, $ciot, $driver] = $this->makeGeneralCargoTrip(
+            cteWeight: '100.20',
+            ciotWeight: '200.30',
+        );
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('peso');
+
+        $this->buildGeneralCargoSnapshot($document, $ciot, $driver, ['type' => '05']);
+    }
+
+    public function test_general_cargo_weight_rejects_manual_weight_conflicting_with_cte_and_ciot(): void
+    {
+        [$document, $ciot, $driver] = $this->makeGeneralCargoTrip('100.20', '100.20');
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('pesos');
+
+        $this->buildGeneralCargoSnapshot($document, $ciot, $driver, [
+            'type' => '05',
+            'weight_kg' => '300.40',
+        ]);
+    }
+
+    public function test_general_cargo_weight_uses_a_consistent_top_level_cte_fallback(): void
+    {
+        [$document, $ciot, $driver] = $this->makeGeneralCargoTrip('100.20', '100.20');
+        $cteSnapshot = $document->snapshot;
+        $cteSnapshot['cargo']['weight_kg'] = null;
+        $document->forceFill(['snapshot' => $cteSnapshot])->save();
+
+        $snapshot = $this->buildGeneralCargoSnapshot($document->fresh(), $ciot, $driver, ['type' => '05']);
+
+        $this->assertSame('100.2000', $snapshot['cargo']['weight_kg']);
+    }
+
+    public function test_general_cargo_weight_rejects_conflicting_or_overprecision_cte_candidates(): void
+    {
+        [$document, $ciot, $driver] = $this->makeGeneralCargoTrip('100.20', '100.20');
+        $cteSnapshot = $document->snapshot;
+        $cteSnapshot['cargo_weight_kg'] = '200.30';
+        $document->forceFill(['snapshot' => $cteSnapshot])->save();
+
+        try {
+            $this->buildGeneralCargoSnapshot($document->fresh(), $ciot, $driver, ['type' => '05']);
+            $this->fail('Os pesos CT-e aninhado e de nível superior devem ser consistentes.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('peso', mb_strtolower($exception->getMessage()));
+        }
+
+        $cteSnapshot['cargo_weight_kg'] = '100.201';
+        $document->forceFill(['snapshot' => $cteSnapshot])->save();
+
+        try {
+            $this->buildGeneralCargoSnapshot($document->fresh(), $ciot, $driver, ['type' => '05']);
+            $this->fail('A precisão inválida não pode ser ignorada por uma fonte prioritária válida.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('duas casas decimais', $exception->getMessage());
+        }
+    }
+
+    public function test_general_cargo_requires_the_final_ciot_weight_to_match_manual_weight(): void
+    {
+        [$document, $ciot, $driver] = $this->makeGeneralCargoTrip('0.00', '0.00');
+        $cteSnapshot = $document->snapshot;
+        $cteSnapshot['cargo']['weight_kg'] = null;
+        $cteSnapshot['cargo_weight_kg'] = null;
+        $document->forceFill(['snapshot' => $cteSnapshot])->save();
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('CIOT');
+
+        $this->buildGeneralCargoSnapshot($document->fresh(), $ciot, $driver, [
+            'type' => '05',
+            'weight_kg' => '100.20',
+        ]);
+    }
+
+    public function test_general_cargo_requires_cte_and_ciot_freight_to_match(): void
+    {
+        [$document, $ciot, $driver] = $this->makeGeneralCargoTrip('100.20', '100.20');
+        $ciot->forceFill(['freight_value_cents' => 100000])->save();
+
+        try {
+            $this->buildGeneralCargoSnapshot($document, $ciot->fresh(), $driver, ['type' => '05']);
+            $this->fail('Frete do CIOT divergente do frete do CT-e deve ser rejeitado.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('frete', mb_strtolower($exception->getMessage()));
+        }
+
+        $ciot->forceFill(['freight_value_cents' => 75000])->save();
+        $snapshot = $this->buildGeneralCargoSnapshot($document, $ciot->fresh(), $driver, ['type' => '05']);
+
+        $this->assertSame('750.00', $snapshot['payment']['contract_value']);
+        $this->assertSame('750.00', $snapshot['payment']['components'][0]['value']);
+
+        $cteSnapshot = $document->snapshot;
+        $cteSnapshot['value'] = '750.001';
+        $document->forceFill(['snapshot' => $cteSnapshot])->save();
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('frete do CT-e');
+
+        $this->buildGeneralCargoSnapshot($document->fresh(), $ciot->fresh(), $driver, ['type' => '05']);
+    }
+
+    public function test_general_cargo_ciot_uses_the_removal_vehicle_driver_and_bank_profiles(): void
+    {
+        [$document, $ciot, $driver] = $this->makeGeneralCargoTrip('1234.56', '1234.56');
+        $ciot->forceFill(['line' => CiotLineEnum::GeneralCargo])->save();
+
+        $snapshot = $this->buildGeneralCargoSnapshot($document, $ciot->fresh(), $driver, ['type' => '05']);
+
+        $this->assertSame(CiotLineEnum::GeneralCargo->value, $snapshot['line']);
+        $this->assertSame($driver->cpf, $snapshot['vehicle']['drivers'][0]['cpf']);
+        $this->assertSame('033', $snapshot['payment']['bank_code']);
+        $this->assertSame('0073', $snapshot['payment']['bank_agency']);
+    }
+
     public function test_uses_configured_bank_details_and_defaults_to_the_confirmed_payment_method(): void
     {
         [$batch, $ciot] = $this->makeTrip();
@@ -563,5 +741,63 @@ class BuildMdfeEmissionSnapshotTest extends TestCase
         ]);
 
         return [$batch, $ciot];
+    }
+
+    /** @return array{CteDocument, Ciot, MdfeDriver} */
+    private function makeGeneralCargoTrip(string $cteWeight, string $ciotWeight): array
+    {
+        $ciot = Ciot::factory()->issued()->create([
+            'line' => CiotLineEnum::GeneralCargo,
+            'vehicles' => [['placa' => 'PUC8E55', 'tipo' => 'automotor']],
+            'cargo_weight_kg' => $ciotWeight,
+            'freight_value_cents' => 75000,
+            'origin' => ['cidade' => 'Osvaldo Cruz', 'uf' => 'SP', 'cep' => '14810539', 'ibge' => '3534609'],
+            'destination' => ['cidade' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140', 'ibge' => '3508504'],
+        ]);
+        $document = CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => null,
+            'register_id' => null,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => [
+                'schema_version' => 5,
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'origin_document_mode' => 'other',
+                'other_document' => ['type' => 'carta_remocao', 'tp_doc' => '99', 'description' => 'CARTA DE REMOCAO'],
+                'nfe_documents' => [],
+                'value' => '750.00',
+                'cargo' => [
+                    'value' => '25000.00',
+                    'predominant_product' => 'PA CARREGADEIRA',
+                    'weight_kg' => $cteWeight,
+                ],
+                'cargo_weight_kg' => $cteWeight,
+                'origin' => ['ibge' => '3534609', 'name' => 'Osvaldo Cruz', 'uf' => 'SP', 'cep' => '14810539'],
+                'destination' => ['ibge' => '3508504', 'name' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140'],
+            ],
+        ]);
+        $driver = MdfeDriver::factory()->create(['line' => CiotLineEnum::VehicleRemoval->value]);
+        CiotVehicle::factory()->forRemoval()->create([
+            'plate' => 'PUC8E55', 'renavam' => '12345678901', 'tare_kg' => 8000,
+            'capacity_kg' => 12000, 'type_rod' => '03', 'body_type' => '00', 'uf' => 'SP',
+        ]);
+
+        return [$document, $ciot, $driver];
+    }
+
+    /** @param array{type: string, ncm?: string|null, weight_kg?: string|null} $generalCargo @return array<string, mixed> */
+    private function buildGeneralCargoSnapshot(
+        CteDocument $document,
+        Ciot $ciot,
+        MdfeDriver $driver,
+        array $generalCargo,
+    ): array {
+        return app(BuildMdfeEmissionSnapshot::class)->handleForDocuments(
+            documents: collect([$document]),
+            ciot: $ciot,
+            endorsements: ['AVERBACAO-GERAL-002'],
+            routeUfs: [],
+            driver: $driver,
+            generalCargo: $generalCargo,
+        );
     }
 }

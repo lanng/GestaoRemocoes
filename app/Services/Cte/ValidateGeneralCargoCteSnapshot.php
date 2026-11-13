@@ -110,6 +110,11 @@ class ValidateGeneralCargoCteSnapshot
         }
 
         $this->assertCargo((array) ($snapshot['cargo'] ?? []));
+
+        if (filled($snapshot['cargo_weight_kg'] ?? null)) {
+            $this->decimal((string) $snapshot['cargo_weight_kg'], 2, 'cargo_weight_kg');
+        }
+
         $this->assertFreight((array) ($snapshot['freight'] ?? []));
 
         if ($forEmission && blank($cfop)) {
@@ -297,6 +302,10 @@ class ValidateGeneralCargoCteSnapshot
     /** @param array<string, mixed> $cargo */
     private function assertCargo(array $cargo): void
     {
+        if (filled($cargo['weight_kg'] ?? null)) {
+            $this->decimal((string) $cargo['weight_kg'], 2, 'carga.weight_kg');
+        }
+
         foreach ([['value', 2]] as [$field, $scale]) {
             if ($this->decimal((string) ($cargo[$field] ?? ''), $scale, "carga.{$field}") <= 0) {
                 throw new DomainException("O campo carga.{$field} deve ser maior que zero.");
@@ -322,11 +331,12 @@ class ValidateGeneralCargoCteSnapshot
         foreach ($measurements as $measurement) {
             $unit = (string) ($measurement['unit'] ?? '');
             $measure = trim((string) ($measurement['measure'] ?? ''));
+            $quantityScale = $unit === '01' ? 2 : 4;
 
             if (! in_array($unit, ['00', '01', '02', '03', '04', '05'], true)
                 || $measure === ''
                 || mb_strlen($measure) > 20
-                || $this->decimal((string) ($measurement['quantity'] ?? ''), 4, 'carga.measurements.quantity') <= 0) {
+                || $this->decimal((string) ($measurement['quantity'] ?? ''), $quantityScale, 'carga.measurements.quantity') <= 0) {
                 throw new DomainException('Uma medida da carga está incompleta ou inválida.');
             }
 
@@ -345,8 +355,8 @@ class ValidateGeneralCargoCteSnapshot
 
                 if ($normalizedMeasure === 'PESO BRUTO'
                     && filled($cargo['weight_kg'] ?? null)
-                    && $this->decimal((string) $measurement['quantity'], 4, 'carga.measurements.quantity')
-                        !== $this->decimal((string) $cargo['weight_kg'], 4, 'carga.weight_kg')) {
+                    && $this->decimal((string) $measurement['quantity'], 2, 'carga.measurements.quantity')
+                        !== $this->decimal((string) $cargo['weight_kg'], 2, 'carga.weight_kg')) {
                     throw new DomainException('A medida PESO BRUTO deve corresponder ao peso bruto informado.');
                 }
             }
