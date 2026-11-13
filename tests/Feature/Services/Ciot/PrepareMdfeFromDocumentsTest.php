@@ -17,6 +17,7 @@ use App\Models\MdfeDriver;
 use App\Services\Ciot\BuildMdfeEmissionSnapshot;
 use App\Services\Ciot\CreateCiotForBatch;
 use App\Services\Ciot\PrefillCiotFromDocuments;
+use App\Services\Ciot\PrepareMdfeDocument;
 use App\Services\Ciot\QueueDirectMdfeEmission;
 use App\Services\Ciot\ValidateMdfeDocumentSelection;
 use DomainException;
@@ -153,6 +154,19 @@ class PrepareMdfeFromDocumentsTest extends TestCase
         app(ValidateMdfeDocumentSelection::class)->handle(new Collection([$document]), $ciot);
     }
 
+    public function test_general_cargo_can_select_an_open_removal_or_general_cargo_ciot_but_not_a_tank_ciot(): void
+    {
+        $removalCiot = Ciot::factory()->issued()->create(['line' => CiotLineEnum::VehicleRemoval]);
+        $generalCargoCiot = Ciot::factory()->issued()->create(['line' => CiotLineEnum::GeneralCargo]);
+        $tankCiot = Ciot::factory()->issued()->tankAlcohol()->create();
+
+        $eligibleCiots = app(PrepareMdfeDocument::class)->eligibleCiots(CiotLineEnum::GeneralCargo);
+
+        $this->assertContains($removalCiot->id, $eligibleCiots->modelKeys());
+        $this->assertContains($generalCargoCiot->id, $eligibleCiots->modelKeys());
+        $this->assertNotContains($tankCiot->id, $eligibleCiots->modelKeys());
+    }
+
     public function test_rejects_multiple_alcohol_ctes_in_one_manifest_selection(): void
     {
         $batch = CteEmissionBatch::factory()->create();
@@ -165,6 +179,21 @@ class PrepareMdfeFromDocumentsTest extends TestCase
             new Collection([$this->tankAlcoholDocument($batch), $this->tankAlcoholDocument($batch)]),
             $ciot,
         );
+    }
+
+    public function test_rejects_multiple_general_cargo_ctes_in_one_manifest_selection(): void
+    {
+        $batch = CteEmissionBatch::factory()->create();
+        $ciot = Ciot::factory()->issued()->create(['line' => CiotLineEnum::VehicleRemoval]);
+        $documents = new Collection([
+            $this->vehicleDocument($batch, ['line' => CiotLineEnum::GeneralCargo->value]),
+            $this->vehicleDocument($batch, ['line' => CiotLineEnum::GeneralCargo->value]),
+        ]);
+
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('carga geral aceita exatamente um CT-e');
+
+        app(ValidateMdfeDocumentSelection::class)->handle($documents, $ciot);
     }
 
     public function test_prefills_alcohol_ciot_from_real_cargo_and_effective_delivery(): void
@@ -215,6 +244,159 @@ class PrepareMdfeFromDocumentsTest extends TestCase
         $prefill = app(PrefillCiotFromDocuments::class)->handle(new Collection([$document]));
 
         $this->assertSame('16023', $prefill['form']['cargo_weight_kg']);
+    }
+
+    public function test_prefills_general_cargo_with_only_its_real_cte_weight_and_keeps_its_cioting_line(): void
+    {
+        $document = $this->vehicleDocument(CteEmissionBatch::factory()->create(), [
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'cargo_value' => '25000.00',
+            'cargo_weight_kg' => '1234.56',
+            'cargo' => [
+                'value' => '25000.00',
+                'weight_kg' => '1234.56',
+                'predominant_product' => 'PA CARREGADEIRA',
+            ],
+        ]);
+
+        $prefill = app(PrefillCiotFromDocuments::class)->handle(new Collection([$document]));
+
+        $this->assertSame(CiotLineEnum::GeneralCargo->value, $prefill['form']['line']);
+        $this->assertSame('1234.56', (string) $prefill['form']['cargo_weight_kg']);
+        $this->assertSame('500.00', $prefill['form']['freight_value']);
+
+        $snapshot = $document->snapshot;
+        $snapshot['cargo']['weight_kg'] = null;
+        $document->forceFill(['snapshot' => $snapshot])->save();
+        $prefill = app(PrefillCiotFromDocuments::class)->handle(new Collection([$document->fresh()]));
+
+        $this->assertSame('1234.56', (string) $prefill['form']['cargo_weight_kg']);
+
+        $snapshot = $document->snapshot;
+        unset($snapshot['cargo']['weight_kg'], $snapshot['cargo_weight_kg']);
+        $document->forceFill(['snapshot' => $snapshot])->save();
+        $prefill = app(PrefillCiotFromDocuments::class)->handle(new Collection([$document->fresh()]));
+
+        $this->assertSame(CiotLineEnum::GeneralCargo->value, $prefill['form']['line']);
+        $this->assertSame('', (string) $prefill['form']['cargo_weight_kg']);
+        $this->assertStringContainsString('não informa o peso real', implode(' ', $prefill['warnings']));
+    }
+
+    public function test_general_cargo_does_not_guess_ciot_parties_from_companies_in_the_destination_city(): void
+    {
+        Company::factory()->create([
+            'cnpj' => '11222333000181',
+            'city' => 'Caçapava',
+            'state' => 'SP',
+            'ibge_code' => '3508504',
+        ]);
+        Company::factory()->create([
+            'cnpj' => '22333444000192',
+            'city' => 'Caçapava',
+            'state' => 'SP',
+            'ibge_code' => '3508504',
+        ]);
+        $document = $this->vehicleDocument(CteEmissionBatch::factory()->create(), [
+            'schema_version' => 5,
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'taker_code' => '3',
+            'rem' => ['cnpj' => '33444555000103', 'xNome' => 'Remetente'],
+            'dest' => ['cpf' => '12345678909', 'xNome' => 'Destinatário pessoa física'],
+            'cargo_value' => '25000.00',
+            'cargo_weight_kg' => '1234.56',
+            'cargo' => [
+                'value' => '25000.00',
+                'weight_kg' => '1234.56',
+                'predominant_product' => 'PA CARREGADEIRA',
+            ],
+            'freight' => ['total' => '500.00'],
+            'value' => '500.00',
+            'origin' => ['ibge' => '9999999', 'name' => 'Origem fora da base', 'uf' => 'SP', 'cep' => '17700000'],
+            'destination' => ['ibge' => '3508504', 'name' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140'],
+        ]);
+
+        $prefill = app(PrefillCiotFromDocuments::class)->handle(new Collection([$document]));
+
+        $this->assertNull($prefill['form']['payer_id']);
+        $this->assertNull($prefill['form']['delivery_payer_id']);
+        $this->assertSame([], $prefill['form']['additional_payers']);
+        $this->assertSame('lotation', $prefill['form']['operation_type']);
+        $this->assertSame('Origem fora da base', $prefill['form']['origin.cidade']);
+        $this->assertSame('9999999', $prefill['form']['origin.ibge']);
+        $this->assertSame('17700000', $prefill['form']['origin.cep']);
+        $this->assertSame('Caçapava', $prefill['form']['destination']['cidade']);
+        $this->assertSame('12286140', $prefill['form']['destination']['cep']);
+        $this->assertNull($prefill['form']['distance_km']);
+        $this->assertStringContainsString('tomador', mb_strtolower(implode(' ', $prefill['warnings'])));
+        $this->assertStringContainsString('manualmente', mb_strtolower(implode(' ', $prefill['warnings'])));
+        $this->assertStringContainsString('destinatário', mb_strtolower(implode(' ', $prefill['warnings'])));
+    }
+
+    public function test_general_cargo_uses_the_explicit_taker_and_recipient_cnpjs_and_cte_route(): void
+    {
+        City::factory()->create([
+            'ibge_code' => '3506003',
+            'name' => 'Bauru',
+            'state' => 'SP',
+            'latitude' => -22.3145,
+            'longitude' => -49.0587,
+        ]);
+        City::factory()->create([
+            'ibge_code' => '3525102',
+            'name' => 'Jardinópolis',
+            'state' => 'SP',
+            'latitude' => -21.0178,
+            'longitude' => -47.7639,
+        ]);
+        $payer = Company::factory()->create([
+            'cnpj' => '44555666000114',
+            'name' => 'Tomador registrado',
+            'city' => 'Bauru',
+            'state' => 'SP',
+            'ibge_code' => '3506003',
+        ]);
+        $delivery = Company::factory()->create([
+            'cnpj' => '55666777000125',
+            'name' => 'Destinatário registrado',
+            'city' => 'Jardinópolis',
+            'state' => 'SP',
+            'ibge_code' => '3525102',
+        ]);
+        $document = $this->vehicleDocument(CteEmissionBatch::factory()->create(), [
+            'schema_version' => 5,
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'taker_code' => '4',
+            'taker' => ['cnpj' => $payer->cnpj, 'xNome' => 'Tomador registrado'],
+            'rem' => ['cnpj' => '33444555000103', 'xNome' => 'Remetente'],
+            'dest' => ['cnpj' => $delivery->cnpj, 'xNome' => 'Destinatário registrado'],
+            'cargo_value' => '25000.00',
+            'cargo_weight_kg' => '1234.56',
+            'cargo' => [
+                'value' => '25000.00',
+                'weight_kg' => '1234.56',
+                'predominant_product' => 'PA CARREGADEIRA',
+            ],
+            'freight' => ['total' => '500.00'],
+            'value' => '500.00',
+            'origin' => ['ibge' => '3534609', 'name' => 'Osvaldo Cruz', 'uf' => 'SP', 'cep' => '17700000'],
+            'destination' => ['ibge' => '3508504', 'name' => 'Caçapava', 'uf' => 'SP', 'cep' => '12286140'],
+        ]);
+
+        $prefill = app(PrefillCiotFromDocuments::class)->handle(new Collection([$document]));
+
+        $this->assertSame($payer->id, $prefill['form']['payer_id']);
+        $this->assertSame($payer->cnpj, $prefill['form']['payer_cnpj']);
+        $this->assertSame($delivery->id, $prefill['form']['delivery_payer_id']);
+        $this->assertSame($delivery->cnpj, $prefill['form']['delivery_payer_cnpj']);
+        $this->assertSame([], $prefill['form']['additional_payers']);
+        $this->assertSame('lotation', $prefill['form']['operation_type']);
+        $this->assertSame('Osvaldo Cruz', $prefill['form']['origin.cidade']);
+        $this->assertSame('17700000', $prefill['form']['origin.cep']);
+        $this->assertSame('Caçapava', $prefill['form']['destination']['cidade']);
+        $this->assertSame('12286140', $prefill['form']['destination']['cep']);
+        $this->assertSame(716, $prefill['form']['distance_km']);
+        $this->assertSame('500.00', $prefill['form']['freight_value']);
+        $this->assertSame('1234.56', $prefill['form']['cargo_weight_kg']);
     }
 
     public function test_builds_alcohol_mdfe_cargo_from_the_selected_cte_snapshot(): void

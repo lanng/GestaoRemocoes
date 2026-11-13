@@ -17,6 +17,7 @@ use App\Services\Ciot\CepLookup;
 use App\Services\Ciot\CityDistanceCalculator;
 use App\Services\Ciot\CloseCiot;
 use App\Services\Ciot\EmitCiotDeclaration;
+use App\Services\Cte\ExactDecimal;
 use App\Support\PtbrNumeric;
 use App\Support\PtbrNumericRule;
 use DomainException;
@@ -59,7 +60,7 @@ class CiotResource extends Resource
     /**
      * @return list<Forms\Components\Component>
      */
-    public static function formSchema(bool $lineReadOnly = false): array
+    public static function formSchema(bool $lineReadOnly = false, bool $allowGeneralCargoWeightFallback = false): array
     {
         return [
             Forms\Components\Hidden::make('status')
@@ -172,8 +173,13 @@ class CiotResource extends Resource
                         ->prefix('R$')
                         ->inputMode('decimal')
                         ->rule(new PtbrNumericRule(min: 0.01))
+                        ->rules(fn (Forms\Get $get): array => CiotLineEnum::tryFrom((string) $get('line')) === CiotLineEnum::GeneralCargo
+                            ? [self::exactGeneralCargoDecimalRule('frete', mustBePositive: true)]
+                            : [])
                         ->required()
-                        ->dehydrateStateUsing(fn ($state) => PtbrNumeric::normalize($state))
+                        ->dehydrateStateUsing(fn ($state, Forms\Get $get) => CiotLineEnum::tryFrom((string) $get('line')) === CiotLineEnum::GeneralCargo
+                            ? $state
+                            : PtbrNumeric::normalize($state))
                         ->afterStateHydrated(function (?Ciot $record, Forms\Set $set): void {
                             if ($record !== null) {
                                 $set('freight_value', PtbrNumeric::format($record->freight_value_cents / 100));
@@ -184,7 +190,14 @@ class CiotResource extends Resource
                         ->inputMode('decimal')
                         ->formatStateUsing(fn ($state) => PtbrNumeric::format($state))
                         ->rule(new PtbrNumericRule(min: 0))
-                        ->dehydrateStateUsing(fn ($state) => PtbrNumeric::normalize($state)),
+                        ->rules(fn (Forms\Get $get): array => CiotLineEnum::tryFrom((string) $get('line')) === CiotLineEnum::GeneralCargo
+                            ? [self::exactGeneralCargoDecimalRule('peso', mustBePositive: true)]
+                            : [])
+                        ->required(fn (Forms\Get $get): bool => ! $allowGeneralCargoWeightFallback
+                            && CiotLineEnum::tryFrom((string) $get('line')) === CiotLineEnum::GeneralCargo)
+                        ->dehydrateStateUsing(fn ($state, Forms\Get $get) => CiotLineEnum::tryFrom((string) $get('line')) === CiotLineEnum::GeneralCargo
+                            ? $state
+                            : PtbrNumeric::normalize($state)),
                     Forms\Components\CheckboxList::make('vehicle_ids')
                         ->label('Veículos (1 automotor + reboques)')
                         ->options(fn (Forms\Get $get): array => self::vehicleOptions(
@@ -543,6 +556,18 @@ class CiotResource extends Resource
      */
     public static function transformFormData(array $data): array
     {
+        if (CiotLineEnum::tryFrom((string) ($data['line'] ?? '')) === CiotLineEnum::GeneralCargo) {
+            $freightValue = self::exactGeneralCargoDecimal($data['freight_value'] ?? null, 'frete');
+            $cargoWeight = self::exactGeneralCargoDecimal($data['cargo_weight_kg'] ?? null, 'peso');
+
+            if ($freightValue <= 0 || $cargoWeight <= 0) {
+                throw new DomainException('O frete e o peso da carga geral devem ser maiores que zero.');
+            }
+
+            $data['freight_value'] = ExactDecimal::format($freightValue, 2);
+            $data['cargo_weight_kg'] = ExactDecimal::format($cargoWeight, 2);
+        }
+
         $payer = Company::query()->findOrFail($data['payer_id']);
         $delivery = Company::query()->find($data['delivery_payer_id'] ?? null) ?? $payer;
         $vehicles = CiotVehicle::query()->whereIn('id', $data['vehicle_ids'] ?? [])->get();
@@ -654,10 +679,12 @@ class CiotResource extends Resource
     /** @return array<int|string, string> */
     protected static function vehicleOptions(?string $line = null): array
     {
+        $operationalProfile = CiotLineEnum::tryFrom((string) $line)?->operationalProfile()->value;
+
         return CiotVehicle::query()
             ->where('is_active', true)
-            ->when($line !== null, fn ($query) => $query->where(fn ($query) => $query
-                ->where('line', $line)
+            ->when($operationalProfile !== null, fn ($query) => $query->where(fn ($query) => $query
+                ->where('line', $operationalProfile)
                 ->orWhereNull('line')))
             ->orderBy('type')
             ->orderBy('plate')
@@ -669,6 +696,42 @@ class CiotResource extends Resource
                 $vehicle->axles,
             )])
             ->all();
+    }
+
+    private static function exactGeneralCargoDecimal(mixed $value, string $label): int
+    {
+        $normalized = PtbrNumeric::normalize($value);
+
+        if ($normalized === null) {
+            throw new DomainException("O {$label} da carga geral deve conter até duas casas decimais.");
+        }
+
+        try {
+            return ExactDecimal::parse($normalized, 2, 'CIOT avulso', $label);
+        } catch (DomainException $exception) {
+            throw new DomainException("O {$label} da carga geral deve conter até duas casas decimais.", previous: $exception);
+        }
+    }
+
+    public static function exactGeneralCargoDecimalRule(string $label, bool $mustBePositive = false): \Closure
+    {
+        return function (string $attribute, mixed $value, \Closure $fail) use ($label, $mustBePositive): void {
+            if (blank($value)) {
+                return;
+            }
+
+            try {
+                $scaledValue = self::exactGeneralCargoDecimal($value, $label);
+            } catch (DomainException $exception) {
+                $fail($exception->getMessage());
+
+                return;
+            }
+
+            if ($mustBePositive && $scaledValue <= 0) {
+                $fail("O {$label} da carga geral deve ser maior que zero.");
+            }
+        };
     }
 
     /**

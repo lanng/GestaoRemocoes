@@ -52,15 +52,20 @@ class ValidateMdfeDocumentSelection
 
         $line = $lines->first();
 
-        if ($line === CiotLineEnum::TankAlcohol && $documents->count() !== 1) {
-            throw new DomainException('O MDF-e de álcool aceita exatamente um CT-e.');
+        if (in_array($line, [CiotLineEnum::TankAlcohol, CiotLineEnum::GeneralCargo], true) && $documents->count() !== 1) {
+            throw new DomainException($line === CiotLineEnum::GeneralCargo
+                ? 'O MDF-e avulso de carga geral aceita exatamente um CT-e.'
+                : 'O MDF-e de álcool aceita exatamente um CT-e.');
         }
 
         $ciotLine = $ciot->line instanceof CiotLineEnum
             ? $ciot->line
             : CiotLineEnum::tryFrom((string) $ciot->line);
 
-        if ($ciotLine !== $line) {
+        $ciotMatchesLine = $ciotLine === $line
+            || ($line === CiotLineEnum::GeneralCargo && $ciotLine === CiotLineEnum::VehicleRemoval);
+
+        if (! $ciotMatchesLine) {
             throw new DomainException('A linha do CIOT deve corresponder à modalidade dos CT-es selecionados.');
         }
 

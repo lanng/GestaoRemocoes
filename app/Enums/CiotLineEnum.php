@@ -6,12 +6,22 @@ enum CiotLineEnum: string
 {
     case VehicleRemoval = 'vehicle_removal';
     case TankAlcohol = 'tank_alcohol';
+    case GeneralCargo = 'general_cargo';
 
     public function label(): string
     {
         return match ($this) {
             self::VehicleRemoval => 'Remoção de veículos',
             self::TankAlcohol => 'Tanque de álcool',
+            self::GeneralCargo => 'Avulso / carga geral',
+        };
+    }
+
+    public function operationalProfile(): self
+    {
+        return match ($this) {
+            self::GeneralCargo => self::VehicleRemoval,
+            default => $this,
         };
     }
 
@@ -25,6 +35,7 @@ enum CiotLineEnum: string
         return match ($this) {
             self::VehicleRemoval => '0001',
             self::TankAlcohol => '0003',
+            self::GeneralCargo => '0001',
         };
     }
 
@@ -36,6 +47,7 @@ enum CiotLineEnum: string
         return match ($this) {
             self::VehicleRemoval => 5,
             self::TankAlcohol => 2,
+            self::GeneralCargo => 5,
         };
     }
 
@@ -47,6 +59,7 @@ enum CiotLineEnum: string
         return match ($this) {
             self::VehicleRemoval => 'vehicle_removal',
             self::TankAlcohol => 'tank_alcohol',
+            self::GeneralCargo => 'vehicle_removal',
         };
     }
 }

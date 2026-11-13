@@ -21,6 +21,7 @@ class PrepareMdfeDocument
         private readonly EmitCiotDeclaration $ciotEmitter,
         private readonly ValidateMdfeDocumentSelection $selectionValidator,
         private readonly QueueDirectMdfeEmission $mdfeQueue,
+        private readonly ResolveGeneralCargoMdfeCargo $generalCargoResolver,
     ) {}
 
     /**
@@ -37,15 +38,41 @@ class PrepareMdfeDocument
         }
 
         $line = $this->selectedLine($documents);
+
+        if (array_key_exists('line', $data) && CiotLineEnum::tryFrom((string) $data['line']) !== $line) {
+            throw new DomainException('A modalidade informada deve corresponder aos CT-es selecionados.');
+        }
+
         $endorsements = $this->endorsements($data['endorsements'] ?? null);
         $routeUfs = $this->routeUfs($data['route_ufs'] ?? []);
         $driver = $this->driver($line, $data['driver_id'] ?? null);
         $homologationFixture = $this->homologationFixture($data);
 
+        $ciotMode = $data['ciot_mode'] ?? null;
+        $preflightCiot = null;
+        $newCiotData = is_array($data['new_ciot'] ?? null) ? $data['new_ciot'] : null;
+
+        if ($line === CiotLineEnum::GeneralCargo) {
+            $generalCargo = is_array($data['general_cargo'] ?? null) ? $data['general_cargo'] : null;
+
+            if ($ciotMode === 'existing') {
+                $preflightCiot = $this->existingCiot($documents, $data['ciot_id'] ?? null);
+                $this->generalCargoResolver->handle($documents->first(), $generalCargo, $preflightCiot);
+            } elseif ($ciotMode === 'new' && $newCiotData !== null) {
+                $newCiotData = $this->generalCargoResolver->prepareNewCiotData(
+                    $documents->first(),
+                    $generalCargo,
+                    $newCiotData,
+                );
+            } else {
+                throw new DomainException('Preencha os dados para criar um novo CIOT.');
+            }
+        }
+
         $ciotEmissionResult = null;
-        $ciot = match ($data['ciot_mode'] ?? null) {
+        $ciot = $preflightCiot ?? match ($ciotMode) {
             'existing' => $this->existingCiot($documents, $data['ciot_id'] ?? null),
-            'new' => $this->createAndEmitCiot($documents, $data['new_ciot'] ?? null, $batch, $ciotEmissionResult),
+            'new' => $this->createAndEmitCiot($documents, $newCiotData, $batch, $ciotEmissionResult),
             default => throw new DomainException('Escolha um CIOT emitido ou crie e emita um novo CIOT.'),
         };
 
@@ -72,6 +99,7 @@ class PrepareMdfeDocument
                 paymentMethod: $data['payment_method'] ?? null,
                 paymentBankCode: $data['payment_bank_code'] ?? null,
                 paymentBankAgency: $data['payment_bank_agency'] ?? null,
+                generalCargo: is_array($data['general_cargo'] ?? null) ? $data['general_cargo'] : null,
             );
         } catch (DomainException $exception) {
             if ($ciotEmissionResult === null) {
@@ -185,7 +213,13 @@ class PrepareMdfeDocument
     public function eligibleCiots(CiotLineEnum $line, ?int $batchId = null): Collection
     {
         return Ciot::query()
-            ->where('line', $line->value)
+            ->where(function (Builder $query) use ($line): void {
+                $query->where('line', $line->value);
+
+                if ($line === CiotLineEnum::GeneralCargo) {
+                    $query->orWhere('line', CiotLineEnum::VehicleRemoval->value);
+                }
+            })
             ->where('status', CiotStatusEnum::ISSUED->value)
             ->when($batchId !== null, fn (Builder $query): Builder => $query->where('cte_emission_batch_id', $batchId))
             ->whereDoesntHave('mdfeDocuments', function (Builder $query): void {
@@ -303,8 +337,10 @@ class PrepareMdfeDocument
 
         $line = $lines->first();
 
-        if ($line === CiotLineEnum::TankAlcohol && $documents->count() !== 1) {
-            throw new DomainException('O MDF-e de álcool aceita exatamente um CT-e.');
+        if (in_array($line, [CiotLineEnum::TankAlcohol, CiotLineEnum::GeneralCargo], true) && $documents->count() !== 1) {
+            throw new DomainException($line === CiotLineEnum::GeneralCargo
+                ? 'O MDF-e avulso de carga geral aceita exatamente um CT-e.'
+                : 'O MDF-e de álcool aceita exatamente um CT-e.');
         }
 
         return $line;
@@ -373,7 +409,7 @@ class PrepareMdfeDocument
         }
 
         $driver = MdfeDriver::query()
-            ->where('line', $line->value)
+            ->where('line', $line->operationalProfile()->value)
             ->where('is_active', true)
             ->find((int) $driverId);
 

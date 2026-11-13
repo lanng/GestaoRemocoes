@@ -227,6 +227,34 @@ class BuildMdfeXmlTest extends TestCase
         );
     }
 
+    public function test_serializes_explicit_general_cargo_classification_and_ncm_using_the_local_mdfe_xsd(): void
+    {
+        $snapshot = $this->snapshot();
+        $snapshot['line'] = 'general_cargo';
+        $snapshot['cargo'] = [
+            'value' => '25000.00',
+            'weight_kg' => '1234.5600',
+            'predominant_product' => 'PA CARREGADEIRA',
+            'type' => '11',
+            'ncm' => '84295100',
+        ];
+        $snapshot['insurance'] = app(BuildMdfeInsuranceSnapshot::class)->handle(
+            ['AVERBACAO-GENERAL-CARGO'],
+            ['insurer_name' => 'Seguradora Fixture', 'insurer_cnpj' => '11111111111111', 'policy_number' => 'FIX-GEN-001'],
+        );
+
+        $built = app(BuildMdfeXml::class)->handle($snapshot, number: 900000001, series: 1, numericCode: '12345678');
+        $signedXml = $this->signer->sign($built->xml, 'infMDFe', 'http://www.portalfiscal.inf.br/mdfe', 'MDFe'.$built->accessKey);
+
+        app(XsdValidator::class)->validateMdfe($signedXml);
+
+        $this->assertStringContainsString(
+            '<prodPred><tpCarga>11</tpCarga><xProd>PA CARREGADEIRA</xProd><NCM>84295100</NCM><infLotacao>',
+            $built->xml,
+        );
+        $this->assertStringContainsString('<qCTe>1</qCTe><vCarga>25000.00</vCarga><cUnid>01</cUnid><qCarga>1234.5600</qCarga>', $built->xml);
+    }
+
     public function test_places_trailers_as_siblings_after_the_tractor_in_the_road_modal(): void
     {
         $snapshot = $this->snapshot();

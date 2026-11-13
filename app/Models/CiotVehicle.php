@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Enums\CiotLineEnum;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
@@ -40,7 +41,9 @@ class CiotVehicle extends Model
      */
     public function servesLine(string $line): bool
     {
-        return $this->is_active && ($this->line === null || $this->line === $line);
+        $requestedLine = CiotLineEnum::tryFrom($line)?->operationalProfile()->value ?? $line;
+
+        return $this->is_active && ($this->line === null || $this->line === $requestedLine);
     }
 
     /**

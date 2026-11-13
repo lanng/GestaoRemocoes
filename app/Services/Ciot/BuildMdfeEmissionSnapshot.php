@@ -22,6 +22,7 @@ class BuildMdfeEmissionSnapshot
         private readonly ResolveCteSnapshot $cteSnapshot,
         private readonly BuildMdfeInsuranceSnapshot $insuranceSnapshot,
         private readonly ValidateMdfeDocumentSelection $selectionValidator,
+        private readonly ResolveGeneralCargoMdfeCargo $generalCargoResolver,
     ) {}
 
     /**
@@ -39,6 +40,7 @@ class BuildMdfeEmissionSnapshot
         ?string $paymentMethod = null,
         ?string $paymentBankCode = null,
         ?string $paymentBankAgency = null,
+        ?array $generalCargo = null,
     ): array {
         $ciot = $batch->ciots()
             ->where('status', CiotStatusEnum::ISSUED)
@@ -66,6 +68,7 @@ class BuildMdfeEmissionSnapshot
             paymentMethod: $paymentMethod,
             paymentBankCode: $paymentBankCode,
             paymentBankAgency: $paymentBankAgency,
+            generalCargo: $generalCargo,
         );
     }
 
@@ -87,6 +90,7 @@ class BuildMdfeEmissionSnapshot
         ?string $paymentMethod = null,
         ?string $paymentBankCode = null,
         ?string $paymentBankAgency = null,
+        ?array $generalCargo = null,
     ): array {
         $line = $this->selectionValidator->handle($documents, $ciot);
         $ciotNumber = (string) $ciot->ciot_number;
@@ -111,6 +115,13 @@ class BuildMdfeEmissionSnapshot
         $cargoWeightKg = $line === CiotLineEnum::TankAlcohol
             ? (float) (int) ($cteSnapshots->first()['cargo_weight_kg'] ?? 0)
             : (float) $ciot->cargo_weight_kg;
+        $generalCargoResolution = null;
+
+        if ($line === CiotLineEnum::GeneralCargo) {
+            $generalCargoResolution = $this->generalCargoResolver->handle($documents->first(), $generalCargo, $ciot);
+            $cargoValueCents = $generalCargoResolution['cargo_value_cents'];
+            $cargoWeightKg = $generalCargoResolution['weight_centi_kg'] / 100;
+        }
 
         if ($line === CiotLineEnum::TankAlcohol && $cargoValueCents <= 0) {
             throw new DomainException('O CT-e de álcool precisa informar o valor real da carga no snapshot.');
@@ -120,12 +131,19 @@ class BuildMdfeEmissionSnapshot
             throw new DomainException('O CIOT ou o CT-e selecionado precisa informar o peso real da carga.');
         }
 
-        $cargoType = $this->cargoType($line);
-        $ncm = match ($line) {
+        $generalCargoSnapshot = $line === CiotLineEnum::GeneralCargo
+            ? [
+                'type' => $generalCargoResolution['type'],
+                'ncm' => $generalCargoResolution['ncm'],
+            ]
+            : null;
+        $cargoType = $generalCargoSnapshot['type'] ?? $this->cargoType($line);
+        $ncm = $generalCargoSnapshot['ncm'] ?? match ($line) {
             CiotLineEnum::VehicleRemoval => (string) config('dfe.mdfe.ncm_vehicle_removal'),
             CiotLineEnum::TankAlcohol => (string) config('dfe.mdfe.ncm_tank_alcohol'),
+            CiotLineEnum::GeneralCargo => '',
         };
-        $ncm = preg_replace('/\D/', '', $ncm);
+        $ncm = filled($ncm) ? preg_replace('/\D/', '', (string) $ncm) : null;
 
         return [
             'schema_version' => 1,
@@ -146,7 +164,9 @@ class BuildMdfeEmissionSnapshot
             'inf_lotacao' => $infLotacao,
             'payment' => $this->paymentSnapshot(
                 $ciot,
+                $line,
                 $contractValueCents,
+                $generalCargoResolution['freight_value_cents'] ?? null,
                 $paymentMethod,
                 $paymentBankCode,
                 $paymentBankAgency,
@@ -157,6 +177,7 @@ class BuildMdfeEmissionSnapshot
                 'predominant_product' => match ($line) {
                     CiotLineEnum::VehicleRemoval => 'VEICULOS',
                     CiotLineEnum::TankAlcohol => 'ALCOOL ETILICO',
+                    CiotLineEnum::GeneralCargo => $generalCargoResolution['product'],
                 },
                 'type' => $cargoType,
                 'ncm' => $ncm,
@@ -194,24 +215,26 @@ class BuildMdfeEmissionSnapshot
     /** @return array<string, mixed> */
     private function paymentSnapshot(
         Ciot $ciot,
+        CiotLineEnum $line,
         int $contractValueCents,
+        ?int $generalCargoFreightCents,
         ?string $paymentMethod,
         ?string $paymentBankCode,
         ?string $paymentBankAgency,
     ): array {
-        $line = $ciot->line instanceof CiotLineEnum ? $ciot->line : CiotLineEnum::from((string) $ciot->line);
         $lineConfig = match ($line) {
             CiotLineEnum::VehicleRemoval => 'ciot.lines.vehicle_removal',
             CiotLineEnum::TankAlcohol => 'ciot.lines.tank_alcohol',
+            CiotLineEnum::GeneralCargo => 'ciot.lines.vehicle_removal',
         };
         $bankCode = trim((string) (filled($paymentBankCode) ? $paymentBankCode : config($lineConfig.'.bank_code')));
         $bankAgency = trim((string) (filled($paymentBankAgency) ? $paymentBankAgency : config($lineConfig.'.bank_agency')));
         $payerCnpj = preg_replace('/\D/', '', (string) $ciot->payer_cnpj);
         $payerName = trim((string) $ciot->payer_name);
         $paymentMethod ??= '0';
-        $paymentValueCents = (int) $ciot->freight_value_cents > 0
-            ? (int) $ciot->freight_value_cents
-            : $contractValueCents;
+        $paymentValueCents = $line === CiotLineEnum::GeneralCargo
+            ? (int) $generalCargoFreightCents
+            : ((int) $ciot->freight_value_cents > 0 ? (int) $ciot->freight_value_cents : $contractValueCents);
 
         if ($paymentMethod !== '0') {
             throw new DomainException('O MDF-e aceita pagamento à vista neste fluxo; implemente o pagamento a prazo antes de selecionar outra forma.');
@@ -285,6 +308,7 @@ class BuildMdfeEmissionSnapshot
         return match ($line) {
             CiotLineEnum::VehicleRemoval => '05',
             CiotLineEnum::TankAlcohol => '08',
+            CiotLineEnum::GeneralCargo => throw new DomainException('Selecione explicitamente o tipo de carga do MDF-e avulso.'),
         };
     }
 
@@ -292,6 +316,7 @@ class BuildMdfeEmissionSnapshot
     private function vehicleSnapshot(Ciot $ciot, ?MdfeDriver $selectedDriver): array
     {
         $line = $ciot->line instanceof CiotLineEnum ? $ciot->line->value : (string) $ciot->line;
+        $operationalLine = CiotLineEnum::tryFrom($line)?->operationalProfile()->value ?? $line;
         $ciotVehicles = (array) $ciot->vehicles;
         $plates = collect($ciotVehicles)->map(fn (array $row): string => strtoupper(preg_replace('/[^A-Z0-9]/', '', (string) ($row['placa'] ?? $row['plate'] ?? ''))))->filter()->unique()->values();
         $catalogVehicles = CiotVehicle::query()->whereIn('plate', $plates)->where('is_active', true)->get()->keyBy('plate');
@@ -319,12 +344,12 @@ class BuildMdfeEmissionSnapshot
 
         $driver = $selectedDriver;
 
-        if ($driver === null && $line === CiotLineEnum::VehicleRemoval->value) {
-            $driver = MdfeDriver::query()->where('line', $line)->where('is_active', true)->where('is_default', true)->first();
+        if ($driver === null && $operationalLine === CiotLineEnum::VehicleRemoval->value) {
+            $driver = MdfeDriver::query()->where('line', $operationalLine)->where('is_active', true)->where('is_default', true)->first();
         }
 
-        if (! $driver instanceof MdfeDriver || ! $driver->is_active || $driver->line !== $line) {
-            throw new DomainException($line === CiotLineEnum::VehicleRemoval->value
+        if (! $driver instanceof MdfeDriver || ! $driver->is_active || $driver->line !== $operationalLine) {
+            throw new DomainException($operationalLine === CiotLineEnum::VehicleRemoval->value
                 ? 'Selecione um motorista ativo cadastrado para a linha de remoção de veículos.'
                 : 'Selecione um motorista ativo cadastrado para a linha de tanque de álcool.');
         }

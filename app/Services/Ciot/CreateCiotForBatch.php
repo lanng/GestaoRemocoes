@@ -96,8 +96,10 @@ class CreateCiotForBatch
 
         $line = $lines->first();
 
-        if ($line === CiotLineEnum::TankAlcohol && $documents->count() !== 1) {
-            throw new DomainException('A preparação de álcool aceita exatamente um CT-e.');
+        if (in_array($line, [CiotLineEnum::TankAlcohol, CiotLineEnum::GeneralCargo], true) && $documents->count() !== 1) {
+            throw new DomainException($line === CiotLineEnum::GeneralCargo
+                ? 'A preparação avulsa de carga geral aceita exatamente um CT-e.'
+                : 'A preparação de álcool aceita exatamente um CT-e.');
         }
 
         $this->assertSelectedVehiclesAreEligible($data['vehicle_ids'] ?? null, $line);

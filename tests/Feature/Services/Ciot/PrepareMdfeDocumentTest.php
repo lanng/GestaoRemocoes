@@ -14,6 +14,8 @@ use App\Models\CteDocument;
 use App\Models\CteEmissionBatch;
 use App\Models\MdfeDocument;
 use App\Models\MdfeDriver;
+use App\Services\Ciot\CreateCiotForBatch;
+use App\Services\Ciot\EmitCiotDeclaration;
 use App\Services\Ciot\PrepareMdfeDocument;
 use App\Services\Ciot\QueueDirectMdfeEmission;
 use DomainException;
@@ -75,6 +77,257 @@ class PrepareMdfeDocumentTest extends TestCase
         ]);
 
         $this->assertTrue($result->mdfe->is($mdfe));
+    }
+
+    public function test_preparation_passes_explicit_general_cargo_classification_to_the_mdfe_queue(): void
+    {
+        $document = CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => null,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => [
+                'schema_version' => 5,
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'value' => '500.00',
+                'cargo' => [
+                    'value' => '25000.00',
+                    'predominant_product' => 'PA CARREGADEIRA',
+                    'weight_kg' => '1234.56',
+                ],
+                'cargo_weight_kg' => '1234.56',
+            ],
+        ]);
+        $ciot = Ciot::factory()->issued()->create([
+            'line' => CiotLineEnum::VehicleRemoval,
+            'freight_value_cents' => 50000,
+            'cargo_weight_kg' => '1234.56',
+        ]);
+        $driver = MdfeDriver::factory()->create(['line' => CiotLineEnum::VehicleRemoval->value]);
+        $mdfe = MdfeDocument::factory()->create(['ciot_id' => $ciot->id]);
+
+        $this->mock(QueueDirectMdfeEmission::class)
+            ->shouldReceive('handleForDocuments')
+            ->once()
+            ->withArgs(function (...$arguments) use ($driver): bool {
+                $this->assertSame($driver->id, $arguments[5]->id);
+                $this->assertSame([
+                    'type' => '05',
+                    'ncm' => '84295100',
+                    'weight_kg' => null,
+                ], $arguments[10]);
+
+                return true;
+            })
+            ->andReturn($mdfe);
+
+        app(PrepareMdfeDocument::class)->handle([
+            'cte_document_ids' => [$document->id],
+            'ciot_mode' => 'existing',
+            'ciot_id' => $ciot->id,
+            'driver_id' => $driver->id,
+            'endorsements' => [['number' => 'AVER-001']],
+            'general_cargo' => [
+                'type' => '05',
+                'ncm' => '84295100',
+                'weight_kg' => null,
+            ],
+        ]);
+    }
+
+    public function test_invalid_general_cargo_inputs_are_rejected_before_initial_ciot_creation_or_emission(): void
+    {
+        $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
+        $tractor = CiotVehicle::factory()->forRemoval()->create(['plate' => 'PUC8E55']);
+        $this->mock(CreateCiotForBatch::class)
+            ->shouldReceive('handleForDocuments')
+            ->andThrow(new DomainException('CIOT creator invoked before general-cargo preflight.'));
+        $this->mock(EmitCiotDeclaration::class)->shouldNotReceive('emit');
+
+        $cases = [
+            'invalid type' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['general_cargo']['type'] = '13';
+            },
+            'invalid NCM' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['general_cargo']['ncm'] = '123';
+            },
+            'manual weight precision' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['general_cargo']['weight_kg'] = '100.201';
+            },
+            'manual zero weight' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['general_cargo']['weight_kg'] = '0.00';
+            },
+            'new CIOT freight mismatch' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['new_ciot']['freight_value'] = '751.00';
+            },
+            'new CIOT freight precision' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['new_ciot']['freight_value'] = '500.001';
+            },
+            'CT-e freight precision' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $snapshot['value'] = '500.001';
+            },
+            'CT-e cargo value precision' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $cargo['value'] = '25000.001';
+                $snapshot['cargo'] = $cargo;
+            },
+            'new CIOT weight mismatch' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['new_ciot']['cargo_weight_kg'] = '200.30';
+            },
+            'new CIOT weight precision' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['new_ciot']['cargo_weight_kg'] = '100.201';
+            },
+            'new CIOT missing final weight' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $data['new_ciot']['cargo_weight_kg'] = '0.00';
+                $data['general_cargo']['weight_kg'] = '100.20';
+            },
+            'missing CT-e product description' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $cargo['predominant_product'] = '';
+                $snapshot['cargo'] = $cargo;
+            },
+            'missing CT-e cargo value' => static function (array &$snapshot, array &$cargo, array &$data): void {
+                $cargo['value'] = '0.00';
+                $snapshot['cargo'] = $cargo;
+            },
+        ];
+
+        $errors = [];
+
+        foreach ($cases as $label => $mutate) {
+            $document = $this->generalCargoDocument();
+            $snapshot = $document->snapshot;
+            $cargo = $snapshot['cargo'];
+            $data = [
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'cte_document_ids' => [$document->id],
+                'ciot_mode' => 'new',
+                'driver_id' => $this->driver->id,
+                'new_ciot' => array_replace($this->newCiotFormData($payer, $tractor), [
+                    'line' => CiotLineEnum::GeneralCargo->value,
+                    'freight_value' => '500.00',
+                    'cargo_weight_kg' => '100.20',
+                ]),
+                'general_cargo' => [
+                    'type' => '05',
+                    'ncm' => '84295100',
+                    'weight_kg' => null,
+                ],
+                'endorsements' => [['number' => 'AVER-GERAL-001']],
+            ];
+            $mutate($snapshot, $cargo, $data);
+            $document->forceFill(['snapshot' => $snapshot])->save();
+            $ciotCount = Ciot::query()->count();
+
+            try {
+                app(PrepareMdfeDocument::class)->handle($data);
+                $this->fail("Dados de carga geral inválidos ({$label}) não podem criar ou emitir CIOT.");
+            } catch (DomainException $exception) {
+                $errors[] = $exception->getMessage();
+                $this->assertSame($ciotCount, Ciot::query()->count(), "A validação de {$label} deve ocorrer antes de criar o CIOT.");
+            }
+        }
+
+        $this->assertCount(count($cases), $errors);
+        $this->assertStringNotContainsString('creator invoked before general-cargo preflight', implode(' ', $errors));
+    }
+
+    public function test_supplied_line_must_match_the_selected_cte_before_initial_ciot_creation(): void
+    {
+        $document = $this->controlledVehicleDocument();
+        $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
+        $tractor = CiotVehicle::factory()->forRemoval()->create(['plate' => 'PUC8E55']);
+        $this->mock(CreateCiotForBatch::class)
+            ->shouldReceive('handleForDocuments')
+            ->andThrow(new DomainException('CIOT creator invoked before line verification.'));
+        $this->mock(EmitCiotDeclaration::class)->shouldNotReceive('emit');
+        $ciotCount = Ciot::query()->count();
+
+        try {
+            app(PrepareMdfeDocument::class)->handle([
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'cte_document_ids' => [$document->id],
+                'ciot_mode' => 'new',
+                'driver_id' => $this->driver->id,
+                'new_ciot' => $this->newCiotFormData($payer, $tractor),
+                'endorsements' => [['number' => 'AVER-001']],
+            ]);
+            $this->fail('A modalidade enviada não pode divergir da modalidade real do CT-e.');
+        } catch (DomainException $exception) {
+            $this->assertStringNotContainsString('creator invoked before line verification', $exception->getMessage());
+            $this->assertSame($ciotCount, Ciot::query()->count());
+        }
+    }
+
+    public function test_existing_general_cargo_ciot_is_checked_against_cte_weight_before_queueing(): void
+    {
+        $document = $this->generalCargoDocument();
+        $ciot = Ciot::factory()->issued()->create([
+            'line' => CiotLineEnum::VehicleRemoval,
+            'freight_value_cents' => 50000,
+            'cargo_weight_kg' => '200.30',
+        ]);
+        $this->mock(QueueDirectMdfeEmission::class)->shouldNotReceive('handleForDocuments');
+
+        try {
+            app(PrepareMdfeDocument::class)->handle([
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'cte_document_ids' => [$document->id],
+                'ciot_mode' => 'existing',
+                'ciot_id' => $ciot->id,
+                'driver_id' => $this->driver->id,
+                'endorsements' => [['number' => 'AVER-GERAL-002']],
+                'general_cargo' => ['type' => '05', 'ncm' => null, 'weight_kg' => null],
+            ]);
+            $this->fail('O peso do CIOT existente deve corresponder ao peso do CT-e antes de enfileirar.');
+        } catch (DomainException $exception) {
+            $this->assertStringContainsString('peso', mb_strtolower($exception->getMessage()));
+        }
+    }
+
+    public function test_new_general_cargo_ciot_data_is_normalized_from_cte_weight_when_missing(): void
+    {
+        $preparedData = app(\App\Services\Ciot\ResolveGeneralCargoMdfeCargo::class)->prepareNewCiotData(
+            $this->generalCargoDocument(),
+            ['type' => '05', 'ncm' => null, 'weight_kg' => null],
+            ['freight_value' => '500.00', 'cargo_weight_kg' => null],
+        );
+
+        $this->assertSame('100.20', $preparedData['cargo_weight_kg']);
+    }
+
+    public function test_existing_general_cargo_ciot_without_positive_weight_is_rejected_without_mutation(): void
+    {
+        $document = $this->generalCargoDocument();
+        $this->mock(QueueDirectMdfeEmission::class)->shouldNotReceive('handleForDocuments');
+
+        foreach ([null, '0.00'] as $weight) {
+            $ciot = Ciot::factory()->issued()->create([
+                'line' => CiotLineEnum::GeneralCargo,
+                'freight_value_cents' => 50000,
+                'cargo_weight_kg' => $weight,
+            ]);
+            $before = $ciot->getRawOriginal('cargo_weight_kg');
+
+            try {
+                app(PrepareMdfeDocument::class)->handle([
+                    'line' => CiotLineEnum::GeneralCargo->value,
+                    'cte_document_ids' => [$document->id],
+                    'ciot_mode' => 'existing',
+                    'ciot_id' => $ciot->id,
+                    'driver_id' => $this->driver->id,
+                    'endorsements' => [['number' => 'AVER-GERAL-004']],
+                    'general_cargo' => ['type' => '05', 'ncm' => null, 'weight_kg' => null],
+                ]);
+                $this->fail('Um CIOT já emitido sem peso positivo não deve ser alterado nem reutilizado.');
+            } catch (DomainException $exception) {
+                $this->assertStringContainsString('crie um novo ciot compatível', mb_strtolower($exception->getMessage()));
+                $freshCiot = $ciot->fresh();
+                $after = $freshCiot->getRawOriginal('cargo_weight_kg');
+                $this->assertSame($before === null, $after === null);
+                $this->assertEquals((float) $before, (float) $after);
+                $this->assertSame(CiotStatusEnum::ISSUED, $freshCiot->status);
+            }
+        }
+
+        $this->assertSame(2, Ciot::query()->count());
+        $this->assertSame(0, MdfeDocument::query()->count());
     }
 
     public function test_preparation_rejects_missing_or_invalid_removal_drivers_before_any_ciot_emission(): void
@@ -145,6 +398,59 @@ class PrepareMdfeDocumentTest extends TestCase
         $this->assertNotNull($result->mdfe);
         $this->assertSame($result->ciot->id, $result->mdfe->ciot_id);
         Queue::assertNothingPushed();
+    }
+
+    public function test_new_general_cargo_uses_manual_weight_when_cte_and_new_ciot_weights_are_missing(): void
+    {
+        Queue::fake();
+        $document = $this->generalCargoDocument();
+        $snapshot = $document->snapshot;
+        $snapshot['cargo']['weight_kg'] = null;
+        $snapshot['cargo_weight_kg'] = null;
+        $document->forceFill(['snapshot' => $snapshot])->save();
+        $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Copart Caçapava']);
+        $tractor = CiotVehicle::factory()->forRemoval()->create(['plate' => 'PUC8E55']);
+        $this->fakeAnttAcceptingTheDeclaration('520032959997');
+
+        $queueService = \Mockery::mock(QueueDirectMdfeEmission::class);
+        $queueService->shouldReceive('handleForDocuments')
+            ->once()
+            ->withArgs(function (Collection $documents, Ciot $ciot, array $endorsements, array $routeUfs): bool {
+                $this->assertSame(CiotStatusEnum::ISSUED, $ciot->status);
+                $this->assertSame('100.20', (string) $ciot->cargo_weight_kg);
+                $this->assertCount(1, $documents);
+
+                return true;
+            })
+            ->andReturnUsing(fn (Collection $documents, Ciot $ciot): MdfeDocument => MdfeDocument::factory()->create([
+                'ciot_id' => $ciot->id,
+                'snapshot' => ['cargo' => ['weight_kg' => '100.2000']],
+            ]));
+        $this->app->instance(QueueDirectMdfeEmission::class, $queueService);
+
+        $newCiotData = array_replace($this->newCiotFormData($payer, $tractor), [
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'freight_value' => '500.00',
+            'cargo_weight_kg' => null,
+        ]);
+        $result = app(PrepareMdfeDocument::class)->handle([
+            'line' => CiotLineEnum::GeneralCargo->value,
+            'cte_document_ids' => [$document->id],
+            'ciot_mode' => 'new',
+            'driver_id' => $this->driver->id,
+            'new_ciot' => $newCiotData,
+            'general_cargo' => [
+                'type' => '05',
+                'ncm' => null,
+                'weight_kg' => '100.20',
+            ],
+            'endorsements' => [['number' => 'AVER-GERAL-003']],
+        ]);
+
+        $this->assertSame(CiotStatusEnum::ISSUED, $result->ciot->status);
+        $this->assertSame('100.20', (string) $result->ciot->fresh()->cargo_weight_kg);
+        $this->assertSame('100.2000', $result->mdfe->snapshot['cargo']['weight_kg']);
+        $this->assertSame($result->ciot->id, $result->mdfe->ciot_id);
     }
 
     public function test_it_does_not_queue_an_mdfe_when_the_new_ciot_is_rejected(): void
@@ -486,6 +792,26 @@ class PrepareMdfeDocumentTest extends TestCase
                 'destination' => ['ibge' => '3508504', 'name' => 'Caçapava', 'uf' => 'SP'],
             ],
         ], $overrides));
+    }
+
+    private function generalCargoDocument(): CteDocument
+    {
+        return CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => null,
+            'workflow_origin' => 'controlled_v1',
+            'access_key' => str_pad((string) random_int(1, 999999), 44, '7', STR_PAD_LEFT),
+            'snapshot' => [
+                'schema_version' => 5,
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'value' => '500.00',
+                'cargo' => [
+                    'value' => '25000.00',
+                    'predominant_product' => 'PA CARREGADEIRA',
+                    'weight_kg' => '100.20',
+                ],
+                'cargo_weight_kg' => '100.20',
+            ],
+        ]);
     }
 
     /** @return array<string, mixed> */

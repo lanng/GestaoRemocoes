@@ -2,11 +2,13 @@
 
 namespace Tests\Feature\Services\Ciot;
 
+use App\Enums\CiotLineEnum;
 use App\Enums\CiotStatusEnum;
 use App\Enums\CteEmissionBatchStatusEnum;
 use App\Models\Ciot;
 use App\Models\CiotVehicle;
 use App\Models\Company;
+use App\Models\CteDocument;
 use App\Models\CteEmissionBatch;
 use App\Services\Ciot\CreateCiotForBatch;
 use DomainException;
@@ -103,6 +105,66 @@ class CreateCiotForBatchTest extends TestCase
 
         $this->assertSame($batch->id, $ciot->cte_emission_batch_id);
         $this->assertSame(2, Ciot::query()->where('cte_emission_batch_id', $batch->id)->count());
+    }
+
+    public function test_it_creates_a_general_cargo_ciot_from_one_authorized_standalone_cte_with_removal_fleet(): void
+    {
+        $payer = Company::factory()->create(['cnpj' => '14517191000925', 'name' => 'Contratante da carga']);
+        $tractor = CiotVehicle::factory()->forRemoval()->create(['plate' => 'PUC8E55']);
+        $document = CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => null,
+            'register_id' => null,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => [
+                'schema_version' => 5,
+                'line' => CiotLineEnum::GeneralCargo->value,
+                'origin_document_mode' => 'other',
+                'cargo' => ['value' => '25000.00', 'predominant_product' => 'PA CARREGADEIRA', 'weight_kg' => '1234.56'],
+                'value' => '750.00',
+            ],
+        ]);
+        $data = $this->formData($payer, $tractor);
+        $data['line'] = CiotLineEnum::GeneralCargo->value;
+        $data['cargo_weight_kg'] = '1234.56';
+        $data['freight_value'] = '750.00';
+
+        $ciot = app(CreateCiotForBatch::class)->handleForDocuments(collect([$document]), $data);
+
+        $this->assertSame(CiotLineEnum::GeneralCargo, $ciot->line);
+        $this->assertSame('1234.56', $ciot->cargo_weight_kg);
+        $this->assertSame(75000, $ciot->freight_value_cents);
+        $this->assertSame('PUC8E55', $ciot->vehicles[0]['placa']);
+    }
+
+    public function test_it_rejects_general_cargo_ciot_money_or_weight_precision_before_persisting(): void
+    {
+        $payer = Company::factory()->create(['cnpj' => '14517191000925']);
+        $tractor = CiotVehicle::factory()->forRemoval()->create();
+        $document = CteDocument::factory()->authorized()->create([
+            'cte_emission_batch_id' => null,
+            'register_id' => null,
+            'workflow_origin' => 'controlled_v1',
+            'snapshot' => ['line' => CiotLineEnum::GeneralCargo->value],
+        ]);
+        $baseData = $this->formData($payer, $tractor);
+        $baseData['line'] = CiotLineEnum::GeneralCargo->value;
+
+        foreach ([
+            ['freight_value' => '500,001'],
+            ['cargo_weight_kg' => '2000,001'],
+        ] as $invalidInput) {
+            try {
+                app(CreateCiotForBatch::class)->handleForDocuments(
+                    collect([$document]),
+                    array_replace($baseData, $invalidInput),
+                );
+                $this->fail('General cargo money and weight must be limited to two decimal places.');
+            } catch (DomainException $exception) {
+                $this->assertStringContainsString('duas casas decimais', $exception->getMessage());
+            }
+        }
+
+        $this->assertDatabaseCount('ciots', 0);
     }
 
     public function test_it_rejects_a_stale_batch_after_the_batch_was_reopened_for_review(): void
