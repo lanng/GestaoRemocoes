@@ -5,6 +5,7 @@ namespace Tests\Feature\Filament;
 use App\Enums\CteDocumentStatusEnum;
 use App\Enums\CteEmissionBatchStatusEnum;
 use App\Enums\RegisterStatusEnum;
+use App\Filament\Resources\CteEmissionBatchResource;
 use App\Filament\Resources\RegisterResource;
 use App\Filament\Resources\RegisterResource\Pages\CreateRegister;
 use App\Filament\Resources\RegisterResource\Pages\ListRegisters;
@@ -16,6 +17,7 @@ use App\Models\Register;
 use App\Models\User;
 use Filament\Facades\Filament;
 use Filament\Http\Middleware\Authenticate;
+use Filament\Notifications\Notification;
 use Filament\Support\Enums\Alignment;
 use Filament\Support\Enums\MaxWidth;
 use Filament\Tables\Columns\SelectColumn;
@@ -1639,10 +1641,112 @@ class RegisterResourceTest extends TestCase
         Livewire::test(ListRegisters::class)
             ->callTableBulkAction('createCteEmissionBatch', $registers, ['execution_mode' => 'dry_run'])
             ->assertHasNoTableBulkActionErrors()
-            ->assertNotified('Lote de CT-e criado');
+            ->assertNotified('Lote de CT-e criado')
+            ->assertDispatched('deselectAllTableRecords');
 
         $batch = CteEmissionBatch::query()->sole();
         $this->assertSame(2, $batch->documents()->count());
         $this->assertNull($batch->documents()->first()->replaced_document_id);
+    }
+
+    public function test_the_cte_batch_action_explains_invalid_records_without_losing_the_selection(): void
+    {
+        $valid = Register::factory()->create();
+        $missingValues = Register::factory()->create([
+            'vehicle_plate' => 'ABC1D23',
+            'fipe_value' => null,
+            'payment_code' => null,
+        ]);
+        $missingInsurance = Register::factory()->create([
+            'vehicle_plate' => 'XYZ9A87',
+            'insurance' => '   ',
+        ]);
+        $registers = collect([$valid, $missingValues, $missingInsurance]);
+
+        Livewire::test(ListRegisters::class)
+            ->callTableBulkAction('createCteEmissionBatch', $registers, ['execution_mode' => 'live'])
+            ->assertNotified(
+                Notification::make()
+                    ->danger()
+                    ->persistent()
+                    ->title('Não foi possível criar o lote de CT-e')
+                    ->body("Registro ABC1D23 (#{$missingValues->id}): preencha os campos obrigatórios: código de pagamento, valor FIPE.<br>Registro XYZ9A87 (#{$missingInsurance->id}): preencha os campos obrigatórios: seguradora.<br>Nenhum lote foi criado.")
+            )
+            ->assertTableBulkActionHalted('createCteEmissionBatch')
+            ->assertSet('selectedTableRecords', $registers->map(fn (Register $register): string => (string) $register->id)->all())
+            ->assertSet('mountedTableBulkActionData.execution_mode', 'live')
+            ->assertNotDispatched('deselectAllTableRecords')
+            ->assertNoRedirect()
+            ->assertNotNotified('Lote de CT-e criado');
+
+        $this->assertDatabaseCount('cte_emission_batches', 0);
+        $this->assertDatabaseCount('cte_documents', 0);
+    }
+
+    public function test_the_cte_batch_action_can_be_retried_after_the_record_is_corrected(): void
+    {
+        $register = Register::factory()->create(['insurance' => null]);
+
+        $component = Livewire::test(ListRegisters::class)
+            ->callTableBulkAction('createCteEmissionBatch', [$register], ['execution_mode' => 'live'])
+            ->assertNotified('Não foi possível criar o lote de CT-e')
+            ->assertTableBulkActionHalted('createCteEmissionBatch');
+
+        $register->update(['insurance' => 'ALLIANZ SEGUROS SA']);
+
+        $component
+            ->callMountedTableBulkAction()
+            ->assertHasNoTableBulkActionErrors()
+            ->assertNotified('Lote de CT-e criado')
+            ->assertDispatched('deselectAllTableRecords');
+
+        $batch = CteEmissionBatch::query()->sole();
+        $component->assertRedirect(CteEmissionBatchResource::getUrl('view', ['record' => $batch]));
+        $this->assertSame('live', $batch->execution_mode);
+        $this->assertSame('ALLIANZ SEGUROS SA', $batch->documents()->sole()->snapshot['insurance']);
+    }
+
+    public function test_the_cte_batch_action_notifies_when_the_selected_record_no_longer_exists(): void
+    {
+        $register = Register::factory()->create();
+        $component = Livewire::test(ListRegisters::class)
+            ->mountTableBulkAction('createCteEmissionBatch', [$register]);
+        $register->delete();
+
+        $component
+            ->setTableBulkActionData(['execution_mode' => 'live'])
+            ->callMountedTableBulkAction()
+            ->assertNotified(
+                Notification::make()
+                    ->danger()
+                    ->persistent()
+                    ->title('Não foi possível criar o lote de CT-e')
+                    ->body('Selecione ao menos uma remocao.<br>Nenhum lote foi criado.')
+            )
+            ->assertTableBulkActionHalted('createCteEmissionBatch')
+            ->assertNotDispatched('deselectAllTableRecords')
+            ->assertNoRedirect();
+
+        $this->assertDatabaseCount('cte_emission_batches', 0);
+        $this->assertDatabaseCount('cte_documents', 0);
+    }
+
+    public function test_the_cte_batch_action_escapes_record_data_in_error_notifications(): void
+    {
+        $register = Register::factory()->create([
+            'vehicle_plate' => '<b>ABC',
+            'insurance' => null,
+        ]);
+
+        Livewire::test(ListRegisters::class)
+            ->callTableBulkAction('createCteEmissionBatch', [$register], ['execution_mode' => 'live'])
+            ->assertNotified(
+                Notification::make()
+                    ->danger()
+                    ->persistent()
+                    ->title('Não foi possível criar o lote de CT-e')
+                    ->body("Registro &lt;b&gt;ABC (#{$register->id}): preencha os campos obrigatórios: seguradora.<br>Nenhum lote foi criado.")
+            )
+            ->assertNotDispatched('deselectAllTableRecords');
     }
 }

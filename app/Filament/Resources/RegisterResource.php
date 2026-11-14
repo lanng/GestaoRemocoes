@@ -53,6 +53,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Leandrocfe\FilamentPtbrFormFields\Money;
 use Livewire\Component as LivewireComponent;
 use Livewire\Features\SupportFileUploads\TemporaryUploadedFile;
@@ -511,14 +512,29 @@ class RegisterResource extends Resource
                         ->icon('heroicon-o-document-plus')
                         ->modalDescription(fn (Collection $records): ?string => self::getCteReemissionWarning($records))
                         ->form(fn (Collection $records): array => self::getCteEmissionBatchForm($records))
-                        ->action(function (Collection $records, array $data) {
-                            $batch = app(CreateCteEmissionBatch::class)->handle(
-                                $records,
-                                auth()->user(),
-                                $data['execution_mode'],
-                                reemissionConfirmed: (bool) ($data['confirm_reemission'] ?? false),
-                                reemissionReason: $data['reemission_reason'] ?? null,
-                            );
+                        ->action(function (Collection $records, array $data, BulkAction $action, LivewireComponent $livewire): void {
+                            try {
+                                $batch = app(CreateCteEmissionBatch::class)->handle(
+                                    $records,
+                                    auth()->user(),
+                                    $data['execution_mode'],
+                                    reemissionConfirmed: (bool) ($data['confirm_reemission'] ?? false),
+                                    reemissionReason: $data['reemission_reason'] ?? null,
+                                );
+                            } catch (ValidationException $exception) {
+                                Notification::make()
+                                    ->danger()
+                                    ->persistent()
+                                    ->title('Não foi possível criar o lote de CT-e')
+                                    ->body(collect($exception->errors())
+                                        ->flatten()
+                                        ->map(fn (string $message): string => e($message))
+                                        ->push('Nenhum lote foi criado.')
+                                        ->implode('<br>'))
+                                    ->send();
+
+                                $action->halt();
+                            }
 
                             Notification::make()
                                 ->success()
@@ -526,9 +542,10 @@ class RegisterResource extends Resource
                                 ->body('Revise o lote antes de aprovar a execucao.')
                                 ->send();
 
-                            return redirect(CteEmissionBatchResource::getUrl('view', ['record' => $batch]));
-                        })
-                        ->deselectRecordsAfterCompletion(),
+                            $livewire->deselectAllTableRecords();
+
+                            $livewire->redirect(CteEmissionBatchResource::getUrl('view', ['record' => $batch]));
+                        }),
                     BulkAction::make('export')
                         ->label('Exportar para Excel')
                         ->icon('heroicon-o-document-arrow-down')

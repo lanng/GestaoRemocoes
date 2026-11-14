@@ -47,6 +47,9 @@ class CreateCteEmissionBatch
                 ->lockForUpdate()
                 ->get()
                 ->keyBy('id');
+
+            $this->validateRegisters($lockedRegisters);
+
             foreach ($registers as $selected) {
                 $register = $lockedRegisters->get($selected->id);
 
@@ -64,7 +67,7 @@ class CreateCteEmissionBatch
 
                 if ($authorizedDocument !== null && ! $reemissionConfirmed) {
                     throw ValidationException::withMessages([
-                        'registers' => "A remocao {$register->id} ja possui um CT-e autorizado.",
+                        'registers' => "Registro {$register->vehicle_plate} (#{$register->id}) já possui um CT-e autorizado.",
                     ]);
                 }
 
@@ -142,6 +145,8 @@ class CreateCteEmissionBatch
                 throw ValidationException::withMessages(['registers' => 'Um ou mais registros já têm CT-e autorizado, em outro lote ativo ou com resultado incerto.']);
             }
 
+            $this->validateRegisters($lockedRegisters);
+
             foreach ($registerIds as $registerId) {
                 $register = $lockedRegisters->get($registerId);
                 $this->createDraftDocument($lockedBatch, $register, $lockedBatch->execution_mode);
@@ -166,8 +171,6 @@ class CreateCteEmissionBatch
         ?CteDocument $authorizedDocument = null,
         ?string $reemissionReason = null,
     ): CteDocument {
-        $this->validateRegister($register);
-
         return $batch->documents()->create([
             'public_id' => (string) Str::uuid(),
             'register_id' => $register->id,
@@ -201,19 +204,39 @@ class CreateCteEmissionBatch
         ];
     }
 
-    private function validateRegister(Register $register): void
+    /** @param Collection<int, Register> $registers */
+    private function validateRegisters(Collection $registers): void
     {
         $required = [
-            'vehicle_id', 'vehicle_model', 'vehicle_plate', 'origin_city',
-            'destination_city', 'payment_code', 'insurance', 'fipe_value', 'value',
+            'vehicle_id' => 'código do veículo',
+            'vehicle_model' => 'modelo',
+            'vehicle_plate' => 'placa',
+            'origin_city' => 'cidade de origem',
+            'destination_city' => 'cidade de destino',
+            'payment_code' => 'código de pagamento',
+            'insurance' => 'seguradora',
+            'fipe_value' => 'valor FIPE',
+            'value' => 'valor do transporte',
         ];
+        $errors = [];
 
-        foreach ($required as $field) {
-            if (blank($register->{$field})) {
-                throw ValidationException::withMessages([
-                    'registers' => "O campo {$field} e obrigatorio na remocao {$register->id}.",
-                ]);
+        foreach ($registers as $register) {
+            $missingFields = [];
+
+            foreach ($required as $field => $label) {
+                if (blank($register->{$field})) {
+                    $missingFields[] = $label;
+                }
             }
+
+            if ($missingFields !== []) {
+                $plate = filled($register->vehicle_plate) ? $register->vehicle_plate : 'sem placa';
+                $errors[] = "Registro {$plate} (#{$register->id}): preencha os campos obrigatórios: ".implode(', ', $missingFields).'.';
+            }
+        }
+
+        if ($errors !== []) {
+            throw ValidationException::withMessages(['registers' => $errors]);
         }
     }
 }

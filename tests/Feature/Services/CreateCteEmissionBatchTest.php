@@ -49,6 +49,62 @@ class CreateCteEmissionBatchTest extends TestCase
         $this->assertSame('controlled_v1', $batch->documents->first()->getRawOriginal('workflow_origin'));
     }
 
+    public function test_it_lists_all_missing_fields_by_plate_without_creating_a_partial_batch(): void
+    {
+        $valid = Register::factory()->create();
+        $missingValues = Register::factory()->create([
+            'vehicle_plate' => 'ABC1D23',
+            'payment_code' => null,
+            'fipe_value' => null,
+        ]);
+        $missingInsurance = Register::factory()->create([
+            'vehicle_plate' => 'XYZ9A87',
+            'insurance' => '   ',
+        ]);
+
+        try {
+            app(CreateCteEmissionBatch::class)->handle(
+                collect([$valid, $missingValues, $missingInsurance]),
+                User::factory()->create(),
+                'live',
+            );
+            $this->fail('Incomplete records should prevent the entire batch from being created.');
+        } catch (ValidationException $exception) {
+            $this->assertSame([
+                'registers' => [
+                    "Registro ABC1D23 (#{$missingValues->id}): preencha os campos obrigatórios: código de pagamento, valor FIPE.",
+                    "Registro XYZ9A87 (#{$missingInsurance->id}): preencha os campos obrigatórios: seguradora.",
+                ],
+            ], $exception->errors());
+        }
+
+        $this->assertDatabaseCount('cte_emission_batches', 0);
+        $this->assertDatabaseCount('cte_documents', 0);
+    }
+
+    public function test_it_identifies_a_record_without_a_plate_by_its_id(): void
+    {
+        $register = Register::factory()->create(['vehicle_plate' => '']);
+
+        try {
+            app(CreateCteEmissionBatch::class)->handle(
+                collect([$register]),
+                User::factory()->create(),
+                'dry_run',
+            );
+            $this->fail('A record without a plate should prevent the batch from being created.');
+        } catch (ValidationException $exception) {
+            $this->assertSame([
+                'registers' => [
+                    "Registro sem placa (#{$register->id}): preencha os campos obrigatórios: placa.",
+                ],
+            ], $exception->errors());
+        }
+
+        $this->assertDatabaseCount('cte_emission_batches', 0);
+        $this->assertDatabaseCount('cte_documents', 0);
+    }
+
     public function test_it_rejects_a_register_that_already_has_an_authorized_cte(): void
     {
         $user = User::factory()->create();
@@ -69,6 +125,7 @@ class CreateCteEmissionBatchTest extends TestCase
         ]);
 
         $this->expectException(ValidationException::class);
+        $this->expectExceptionMessage("Registro {$register->vehicle_plate} (#{$register->id}) já possui um CT-e autorizado.");
 
         app(CreateCteEmissionBatch::class)->handle(collect([$register]), $user, 'dry_run');
     }
